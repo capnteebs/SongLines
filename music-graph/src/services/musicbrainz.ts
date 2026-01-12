@@ -6,9 +6,31 @@ import {
   clearCache as clearTrackCache,
   getCacheStats
 } from './trackCache'
-import { getAlbumImage } from './lastfm'
+import { getAlbumImage, getArtistImage as getLastFmArtistImage } from './lastfm'
 import { getTrackCredits as getDiscogsCredits, isConfigured as isDiscogsConfigured } from './discogs'
-import { getArtistImageWithMBID } from './theaudiodb'
+import { getArtistImageWithMBID as getAudioDBArtistImage } from './theaudiodb'
+
+/**
+ * Get artist image with fallback chain: TheAudioDB -> Last.fm
+ * TheAudioDB has artist images (via CORS proxy), Last.fm deprecated them
+ */
+async function getArtistImage(artistName: string, mbid?: string): Promise<string | undefined> {
+  // Try TheAudioDB first (has artist images, uses CORS proxy for canvas compatibility)
+  const audioDbImage = await getAudioDBArtistImage(artistName, mbid)
+  if (audioDbImage) {
+    console.log(`[Image] Found TheAudioDB image for ${artistName}`)
+    return audioDbImage
+  }
+
+  // Fallback to Last.fm (deprecated but might still work for some artists)
+  const lastFmImage = await getLastFmArtistImage(artistName)
+  if (lastFmImage) {
+    console.log(`[Image] Found Last.fm image for ${artistName}`)
+    return lastFmImage
+  }
+
+  return undefined
+}
 
 // Re-export cache utilities for external use
 export { clearTrackCache, getCacheStats }
@@ -877,10 +899,10 @@ export async function buildGraphFromTrack(
     const primaryArtists = artistEntities.filter(e => primaryArtistIds.has(e.id))
     const otherArtists = artistEntities.filter(e => !primaryArtistIds.has(e.id))
 
-    // Fetch primary artists first (no limit) - use TheAudioDB with MBID for accuracy
+    // Fetch primary artists first (no limit) - try Last.fm then TheAudioDB
     for (const entity of primaryArtists) {
       imagePromises.push(
-        getArtistImageWithMBID(entity.name, entity.mbid).then(image => {
+        getArtistImage(entity.name, entity.mbid).then(image => {
           if (image) entity.image = image
         }).catch(() => {})
       )
@@ -890,7 +912,7 @@ export async function buildGraphFromTrack(
     const additionalArtistsLimit = 5
     for (const entity of otherArtists.slice(0, additionalArtistsLimit)) {
       imagePromises.push(
-        getArtistImageWithMBID(entity.name, entity.mbid).then(image => {
+        getArtistImage(entity.name, entity.mbid).then(image => {
           if (image) entity.image = image
         }).catch(() => {})
       )

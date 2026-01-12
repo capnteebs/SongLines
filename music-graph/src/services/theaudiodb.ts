@@ -32,6 +32,43 @@ class RateLimiter {
 
 const rateLimiter = new RateLimiter()
 
+/**
+ * Convert image URL to base64 data URL to bypass CORS for canvas rendering
+ * Uses a CORS proxy since TheAudioDB's CDN doesn't send CORS headers
+ */
+async function toDataURL(url: string): Promise<string | undefined> {
+  // List of CORS proxies to try (in order of preference)
+  const corsProxies = [
+    (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  ]
+
+  for (const proxyFn of corsProxies) {
+    try {
+      const proxiedUrl = proxyFn(url)
+      const response = await fetch(proxiedUrl)
+      if (!response.ok) continue
+
+      const blob = await response.blob()
+      // Verify it's actually an image
+      if (!blob.type.startsWith('image/')) continue
+
+      return new Promise((resolve) => {
+        const reader = new FileReader()
+        reader.onloadend = () => resolve(reader.result as string)
+        reader.onerror = () => resolve(undefined)
+        reader.readAsDataURL(blob)
+      })
+    } catch (e) {
+      // Try next proxy
+      continue
+    }
+  }
+
+  console.warn('[TheAudioDB] All CORS proxies failed for:', url)
+  return undefined
+}
+
 interface AudioDBArtist {
   idArtist: string
   strArtist: string
@@ -88,7 +125,7 @@ export async function searchArtist(artistName: string): Promise<AudioDBArtist | 
 }
 
 /**
- * Get artist image URL
+ * Get artist image as base64 data URL (for canvas/Cytoscape compatibility)
  * Returns the best available image (thumb > fanart > wide thumb)
  */
 export async function getArtistImage(artistName: string): Promise<string | undefined> {
@@ -99,6 +136,7 @@ export async function getArtistImage(artistName: string): Promise<string | undef
   }
 
   // Priority: thumb > fanart > wide thumb > cutout
+  // Use /preview for smaller images (faster loading)
   const imageUrl = artist.strArtistThumb ||
                    artist.strArtistFanart ||
                    artist.strArtistWideThumb ||
@@ -106,9 +144,14 @@ export async function getArtistImage(artistName: string): Promise<string | undef
                    artist.strArtistClearart
 
   if (imageUrl) {
-    // Optionally append /small for smaller images (250px)
-    // return `${imageUrl}/small`
-    console.log(`[TheAudioDB] Found image for ${artistName}`)
+    console.log(`[TheAudioDB] Found image for ${artistName}, converting to data URL...`)
+    // Convert to data URL to bypass CORS for canvas rendering
+    const dataUrl = await toDataURL(imageUrl + '/preview')
+    if (dataUrl) {
+      console.log(`[TheAudioDB] Image converted for ${artistName}`)
+      return dataUrl
+    }
+    // Fallback to original URL (works in <img> but not canvas)
     return imageUrl
   }
 
@@ -147,6 +190,7 @@ export async function getArtistByMBID(mbid: string): Promise<AudioDBArtist | nul
 
 /**
  * Get artist image by MusicBrainz ID (preferred) or name (fallback)
+ * Returns base64 data URL for canvas/Cytoscape compatibility
  */
 export async function getArtistImageWithMBID(
   artistName: string,
@@ -161,7 +205,14 @@ export async function getArtistImageWithMBID(
                        artist.strArtistWideThumb
 
       if (imageUrl) {
-        console.log(`[TheAudioDB] Found image for ${artistName} via MBID`)
+        console.log(`[TheAudioDB] Found image for ${artistName} via MBID, converting...`)
+        // Convert to data URL to bypass CORS for canvas rendering
+        const dataUrl = await toDataURL(imageUrl + '/preview')
+        if (dataUrl) {
+          console.log(`[TheAudioDB] Image converted for ${artistName}`)
+          return dataUrl
+        }
+        // Fallback to original URL
         return imageUrl
       }
     }
