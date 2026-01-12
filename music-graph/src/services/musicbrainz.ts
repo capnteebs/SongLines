@@ -1,0 +1,1413 @@
+import type { MusicGraph, MusicEntity, Relationship, ReleaseType } from '../types/music'
+import {
+  getCachedTrack,
+  setCachedTrack,
+  cleanupExpiredEntries,
+  clearCache as clearTrackCache,
+  getCacheStats
+} from './trackCache'
+import { getAlbumImage } from './lastfm'
+import { getTrackCredits as getDiscogsCredits, isConfigured as isDiscogsConfigured } from './discogs'
+import { getArtistImageWithMBID } from './theaudiodb'
+
+// Re-export cache utilities for external use
+export { clearTrackCache, getCacheStats }
+
+const BASE_URL = 'https://musicbrainz.org/ws/2'
+const USER_AGENT = 'MusicGraph/1.0 (https://github.com/yourusername/music-graph)'
+
+// Clean up expired cache entries on module load
+cleanupExpiredEntries()
+
+// Rate limiter: MusicBrainz requires max 1 request per second
+class RateLimiter {
+  private lastRequestTime = 0
+  private readonly minInterval = 1100 // 1.1 seconds to be safe
+
+  async throttle(): Promise<void> {
+    const now = Date.now()
+    const elapsed = now - this.lastRequestTime
+    if (elapsed < this.minInterval) {
+      await new Promise(resolve => setTimeout(resolve, this.minInterval - elapsed))
+    }
+    this.lastRequestTime = Date.now()
+  }
+}
+
+const rateLimiter = new RateLimiter()
+
+interface MBArtist {
+  id: string
+  name: string
+  'sort-name': string
+  type?: string
+  country?: string
+  'life-span'?: {
+    begin?: string
+    end?: string
+    ended?: boolean
+  }
+}
+
+interface MBRecording {
+  id: string
+  title: string
+  length?: number
+  'artist-credit'?: Array<{
+    artist: MBArtist
+    joinphrase?: string
+  }>
+}
+
+interface MBRelease {
+  id: string
+  title: string
+  date?: string
+  'release-group'?: {
+    id: string
+    title: string
+    'primary-type'?: string
+  }
+}
+
+interface MBWork {
+  id: string
+  title: string
+  type?: string
+  relations?: MBRelation[]
+}
+
+interface MBRelation {
+  type: string
+  'type-id': string
+  direction: 'forward' | 'backward'
+  artist?: MBArtist
+  recording?: MBRecording
+  release?: MBRelease
+  work?: MBWork
+  attributes?: string[]
+}
+
+interface MBReleaseGroup {
+  id: string
+  title: string
+  'primary-type'?: string
+  'secondary-types'?: string[]
+  'first-release-date'?: string
+}
+
+interface MBMedium {
+  position: number
+  format?: string
+  tracks: MBTrack[]
+}
+
+interface MBTrack {
+  id: string
+  number: string
+  title: string
+  length?: number
+  recording: MBRecording
+}
+
+// Result type for drill-down operations
+export interface DrillDownResult {
+  entities: MusicEntity[]
+  relationships: Relationship[]
+}
+
+async function fetchMB<T>(endpoint: string, params: Record<string, string> = {}): Promise<T> {
+  // Apply rate limiting
+  await rateLimiter.throttle()
+
+  const url = new URL(`${BASE_URL}${endpoint}`)
+  url.searchParams.set('fmt', 'json')
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value))
+
+  console.log(`[MusicBrainz] Fetching: ${endpoint}`)
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      'User-Agent': USER_AGENT,
+      'Accept': 'application/json',
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(`MusicBrainz API error: ${response.status}`)
+  }
+
+  return response.json()
+}
+
+export async function searchArtist(query: string): Promise<MBArtist[]> {
+  const data = await fetchMB<{ artists: MBArtist[] }>('/artist', { query })
+  return data.artists || []
+}
+
+interface MBRecordingSearchResult {
+  id: string
+  title: string
+  length?: number
+  score?: number
+  disambiguation?: string
+  'artist-credit': Array<{
+    artist: MBArtist
+    joinphrase?: string
+  }>
+  releases?: Array<{
+    id: string
+    title: string
+    status?: string
+    'release-group'?: {
+      id: string
+      'primary-type'?: string
+      'secondary-types'?: string[]
+    }
+  }>
+}
+
+/**
+ * Clean track name by removing featured artist patterns and version suffixes
+ * Last.fm: "If They Knew (Feat. K. Michelle)"
+ * MusicBrainz: "If They Knew" (with K. Michelle as artist credit)
+ *
+ * Also handles:
+ * - "Warm (LP Version)" -> "Warm"
+ * - "Track Name From Album Name" -> "Track Name"
+ */
+function cleanTrackName(trackName: string): string {
+  // Patterns to remove (case-insensitive)
+  const featPatterns = [
+    /\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+[^\)\]]+[\)\]]/gi,  // (feat. X) or [feat. X]
+    /\s*[-–—]\s*(?:feat\.?|ft\.?|featuring)\s+.+$/gi,              // - feat. X at end
+    /\s*(?:feat\.?|ft\.?|featuring)\s+.+$/gi,                       // feat. X at end (no separator)
+  ]
+
+  let cleaned = trackName
+  for (const pattern of featPatterns) {
+    cleaned = cleaned.replace(pattern, '')
+  }
+
+  // Clean up version suffixes that MusicBrainz might not have
+  const versionPatterns = [
+    /\s*[\(\[](?:official\s*(?:video|audio|music\s*video)?|lyric\s*video|audio|explicit|clean)[\)\]]/gi,
+    /\s*[\(\[](?:radio\s*edit|single\s*version|album\s*version|lp\s*version|12"\s*version|7"\s*version)[\)\]]/gi,
+    /\s*[\(\[](?:extended|original|edit|mix|remix|remaster(?:ed)?|bonus\s*track)[\)\]]/gi,
+    /\s*[\(\[](?:live|acoustic|demo|instrumental)[\)\]]/gi,
+  ]
+
+  for (const pattern of versionPatterns) {
+    cleaned = cleaned.replace(pattern, '')
+  }
+
+  // Remove "From [Album Name]" suffix (common in Last.fm scrobbles)
+  // e.g., "Warm (LP Version) From Change Of Heart" -> "Warm"
+  cleaned = cleaned.replace(/\s+from\s+.+$/i, '')
+
+  return cleaned.trim()
+}
+
+/**
+ * Search for a recording (track) by name, artist, and optionally album
+ */
+export async function searchRecording(
+  trackName: string,
+  artistName?: string,
+  albumName?: string
+): Promise<MBRecordingSearchResult[]> {
+  // Clean the track name to remove featured artists and other suffixes
+  const cleanedTrackName = cleanTrackName(trackName)
+
+  // Log if we cleaned the name
+  if (cleanedTrackName !== trackName) {
+    console.log(`[MusicBrainz] Cleaned track name: "${trackName}" → "${cleanedTrackName}"`)
+  }
+
+  let query = `recording:"${cleanedTrackName}"`
+  if (artistName) {
+    query += ` AND artist:"${artistName}"`
+  }
+  if (albumName) {
+    query += ` AND release:"${albumName}"`
+  }
+
+  const data = await fetchMB<{ recordings: MBRecordingSearchResult[] }>('/recording', {
+    query,
+    limit: '25',
+  })
+
+  // If no results with cleaned name, try original name as fallback
+  if (data.recordings?.length === 0 && cleanedTrackName !== trackName) {
+    console.log(`[MusicBrainz] No results with cleaned name, trying original...`)
+    let fallbackQuery = `recording:"${trackName}"`
+    if (artistName) {
+      fallbackQuery += ` AND artist:"${artistName}"`
+    }
+    if (albumName) {
+      fallbackQuery += ` AND release:"${albumName}"`
+    }
+
+    const fallbackData = await fetchMB<{ recordings: MBRecordingSearchResult[] }>('/recording', {
+      query: fallbackQuery,
+      limit: '25',
+    })
+    return fallbackData.recordings || []
+  }
+
+  return data.recordings || []
+}
+
+/**
+ * Check if a recording title looks like a live/remix/alternate version
+ */
+function isAlternateVersion(title: string, disambiguation?: string): boolean {
+  const lowerDisamb = (disambiguation || '').toLowerCase()
+
+  const alternateIndicators = [
+    'live', 'remix', 'acoustic', 'demo', 'radio edit', 'instrumental',
+    'karaoke', 'cover', 'remaster', 'alternate', 'edit', 'mix',
+    'version', 'reprise', 'interlude', 'skit'
+  ]
+
+  // Check disambiguation field (more reliable indicator)
+  for (const indicator of alternateIndicators) {
+    if (lowerDisamb.includes(indicator)) return true
+  }
+
+  // Check title for common patterns like "(Live)" or "[Remix]"
+  const bracketPattern = /[\(\[\-].*?(live|remix|acoustic|demo|radio|instrumental|remaster|edit|mix).*?[\)\]]/i
+  if (bracketPattern.test(title)) return true
+
+  return false
+}
+
+interface MBRecordingRelease {
+  id: string
+  title: string
+  status?: string
+  'release-group'?: {
+    id: string
+    'primary-type'?: string
+    'secondary-types'?: string[]
+  }
+}
+
+/**
+ * Check if a release is from a compilation, live album, remix album, or soundtrack
+ */
+function isAlternateRelease(release: MBRecordingRelease): boolean {
+  const secondaryTypes = release['release-group']?.['secondary-types'] || []
+  const alternateTypes = ['Live', 'Remix', 'Compilation', 'DJ-mix', 'Mixtape/Street', 'Soundtrack']
+
+  if (secondaryTypes.some((t: string) => alternateTypes.includes(t))) {
+    return true
+  }
+
+  // Also check the title for common compilation/soundtrack indicators
+  const title = release.title.toLowerCase()
+  const compilationIndicators = [
+    'greatest hits', 'best of', 'collection', 'anthology',
+    'soundtrack', 'ost', 'motion picture', 'film', 'movie',
+    'various artists', 'compilation', 'now that\'s what i call',
+    'hits', 'essentials', 'ultimate', 'complete', 'definitive'
+  ]
+
+  return compilationIndicators.some(indicator => title.includes(indicator))
+}
+
+/**
+ * Check if a release title looks like it could be a soundtrack
+ */
+function isSoundtrackRelease(title: string): boolean {
+  const lower = title.toLowerCase()
+  return lower.includes('soundtrack') ||
+         lower.includes('ost') ||
+         lower.includes('motion picture') ||
+         lower.includes('film') ||
+         lower.includes('movie') ||
+         lower.includes('music from') ||
+         lower.includes('inspired by')
+}
+
+/**
+ * Normalize a string for comparison (lowercase, remove punctuation, trim)
+ */
+function normalizeForComparison(str: string): string {
+  return str
+    .toLowerCase()
+    .replace(/[^\w\s]/g, '') // Remove punctuation
+    .replace(/\s+/g, ' ')    // Normalize whitespace
+    .trim()
+}
+
+/**
+ * Score how well a recording matches our search criteria
+ */
+function scoreRecordingMatch(
+  recording: MBRecordingSearchResult,
+  trackName: string,
+  artistName: string,
+  albumName?: string
+): number {
+  let score = recording.score || 0
+
+  const normalizedTrack = normalizeForComparison(trackName)
+  const normalizedRecordingTitle = normalizeForComparison(recording.title)
+  const normalizedArtist = normalizeForComparison(artistName)
+
+  // Exact track title match is a big bonus
+  if (normalizedRecordingTitle === normalizedTrack) {
+    score += 50
+  }
+
+  // Penalize alternate versions heavily
+  if (isAlternateVersion(recording.title, recording.disambiguation)) {
+    score -= 100
+  }
+
+  // Penalize "clean" versions - prefer explicit/original versions which have more complete data
+  const disamb = (recording.disambiguation || '').toLowerCase()
+  if (disamb.includes('clean') || disamb.includes('edited') || disamb.includes('radio edit')) {
+    score -= 50
+  }
+
+  // Bonus for recordings with multiple artist credits (suggests more complete data)
+  // This helps pick collaborative versions over solo versions of the same track
+  const artistCreditCount = (recording['artist-credit'] || []).length
+  if (artistCreditCount > 1) {
+    score += 25 * (artistCreditCount - 1) // +25 per additional artist
+  }
+
+  // Check artist match
+  const recordingArtists = (recording['artist-credit'] || [])
+    .map(c => normalizeForComparison(c.artist.name))
+  if (recordingArtists.some(a => a === normalizedArtist || a.includes(normalizedArtist))) {
+    score += 30
+  }
+
+  // Check album match if provided
+  if (albumName) {
+    const normalizedAlbum = normalizeForComparison(albumName)
+    const releases = recording.releases || []
+
+    let bestReleaseScore = -50 // Penalty if no matching release
+
+    for (const release of releases) {
+      const normalizedReleaseTitle = normalizeForComparison(release.title)
+      let releaseScore = 0
+
+      // Exact album match
+      if (normalizedReleaseTitle === normalizedAlbum) {
+        releaseScore += 80
+      } else if (normalizedReleaseTitle.includes(normalizedAlbum) || normalizedAlbum.includes(normalizedReleaseTitle)) {
+        releaseScore += 40
+      }
+
+      // Bonus for official releases
+      if (release.status === 'Official') {
+        releaseScore += 10
+      }
+
+      // Penalize compilations, live albums, etc.
+      if (isAlternateRelease(release)) {
+        releaseScore -= 60
+      }
+
+      // Prefer Albums over Singles/EPs for matching
+      const primaryType = release['release-group']?.['primary-type']
+      if (primaryType === 'Album') {
+        releaseScore += 15
+      }
+
+      bestReleaseScore = Math.max(bestReleaseScore, releaseScore)
+    }
+
+    score += bestReleaseScore
+  }
+
+  return score
+}
+
+/**
+ * Build a flat graph centered on a track (for Now Playing)
+ * Returns: Track node connected to Artist(s), Album, and Personnel
+ * Uses caching to reduce API calls for frequently played tracks.
+ */
+export async function buildGraphFromTrack(
+  trackName: string,
+  artistName: string,
+  albumName?: string
+): Promise<DrillDownResult> {
+  console.log('[MusicBrainz] Building flat graph for track:', trackName, 'by', artistName, 'from album:', albumName)
+
+  // Check cache first
+  const cached = getCachedTrack(trackName, artistName, albumName)
+  if (cached) {
+    return cached
+  }
+
+  const entities: MusicEntity[] = []
+  const relationships: Relationship[] = []
+  const entityIds = new Set<string>()
+
+  // Search for the recording - include album in search if provided
+  let recordings = await searchRecording(trackName, artistName, albumName)
+
+  // If no results with album, try without it
+  if (recordings.length === 0 && albumName) {
+    console.log('[MusicBrainz] No results with album filter, trying without...')
+    recordings = await searchRecording(trackName, artistName)
+  }
+
+  if (recordings.length === 0) {
+    console.log('[MusicBrainz] No recordings found, falling back to artist search')
+    return { entities: [], relationships: [] }
+  }
+
+  // Score all recordings and pick the best match
+  const scoredRecordings = recordings.map(r => ({
+    recording: r,
+    score: scoreRecordingMatch(r, trackName, artistName, albumName)
+  }))
+
+  // Sort by score descending
+  scoredRecordings.sort((a, b) => b.score - a.score)
+
+  // Log top matches for debugging
+  console.log('[MusicBrainz] Top recording matches:')
+  scoredRecordings.slice(0, 5).forEach((sr, i) => {
+    const releases = sr.recording.releases?.map(r => r.title).join(', ') || 'no releases'
+    console.log(`  ${i + 1}. "${sr.recording.title}" (score: ${sr.score}) - releases: ${releases}`)
+  })
+
+  const bestRecording = scoredRecordings[0]!.recording
+  const recordingMbid = bestRecording.id
+
+  // Fetch FULL recording details to get complete artist credits
+  // Search results may have incomplete/abbreviated artist credits
+  console.log('[MusicBrainz] Fetching full recording details for:', recordingMbid)
+  const fullRecording = await fetchMB<{
+    id: string
+    title: string
+    'artist-credit'?: Array<{ artist: MBArtist; joinphrase?: string }>
+    relations?: MBRelation[]
+  }>(`/recording/${recordingMbid}`, {
+    inc: 'artist-credits+artist-rels+work-rels',
+  })
+
+  // Create track entity
+  const trackId = `track-${recordingMbid}`
+  entities.push({
+    id: trackId,
+    mbid: recordingMbid,
+    name: fullRecording.title,
+    type: 'track',
+    isExpanded: false,
+    isHidden: false,
+    childrenLoaded: true, // We're loading everything
+  })
+  entityIds.add(trackId)
+
+  // Track primary artists vs featured artists from artist-credit
+  // Primary artists should connect to the album, featured artists only to the track
+  const primaryArtistIds = new Set<string>()  // For personnel distinction
+  const albumArtistIds = new Set<string>()    // Only searched artist connects to album
+
+  // Add artists from FULL recording's artist-credit (not search result)
+  // MusicBrainz uses joinphrase to indicate featured artists:
+  // e.g., [{ artist: "Rick Ross", joinphrase: " feat. " }, { artist: "K. Michelle" }]
+  // The joinphrase BEFORE an artist indicates they are featured
+  const artistCredits = fullRecording['artist-credit'] || []
+  console.log(`[MusicBrainz] Found ${artistCredits.length} artist credits:`, artistCredits.map(c => c.artist.name).join(', '))
+  let nextIsFeatured = false
+
+  // Normalize the searched artist name for comparison
+  const normalizedSearchArtist = normalizeForComparison(artistName)
+
+  for (let i = 0; i < artistCredits.length; i++) {
+    const credit = artistCredits[i]!
+    const artistId = `artist-${credit.artist.id}`
+    primaryArtistIds.add(artistId)
+
+    // Determine if this artist is featured based on the PREVIOUS joinphrase
+    const isFeatured = nextIsFeatured
+
+    // Check if the joinphrase indicates the NEXT artist is featured
+    // Note: "&", "and", "/" are NOT featured indicators - they indicate co-primary artists
+    const joinphrase = (credit.joinphrase || '').toLowerCase()
+    nextIsFeatured = joinphrase.includes('feat') ||
+                     joinphrase.includes('ft.') ||
+                     joinphrase.includes('featuring') ||
+                     (joinphrase.includes('with ') && !joinphrase.includes('&'))
+
+    // Only connect to album if:
+    // 1. Not a featured artist (no "feat" prefix), AND
+    // 2. Matches the searched artist name (handles guest artists on solo albums)
+    // This ensures "Reflections Laughing" by The Weeknd, Travis Scott & Florence + the Machine
+    // only connects The Weeknd to the album "Hurry Up Tomorrow", not Travis Scott or Florence
+    const normalizedCreditArtist = normalizeForComparison(credit.artist.name)
+    const matchesSearchedArtist = normalizedCreditArtist === normalizedSearchArtist ||
+                                   normalizedCreditArtist.includes(normalizedSearchArtist) ||
+                                   normalizedSearchArtist.includes(normalizedCreditArtist)
+
+    if (!isFeatured && matchesSearchedArtist) {
+      albumArtistIds.add(artistId)
+    }
+
+    if (!entityIds.has(artistId)) {
+      entities.push({
+        id: artistId,
+        mbid: credit.artist.id,
+        name: credit.artist.name,
+        type: 'artist',
+        isExpanded: false,
+        isHidden: false,
+        childrenLoaded: false,
+      })
+      entityIds.add(artistId)
+    }
+
+    // Track -> Artist relationship with appropriate role
+    const role = isFeatured ? 'featured' : 'primary_artist'
+    relationships.push({
+      id: `rel-${trackId}-${artistId}-${role}`,
+      source: trackId,
+      target: artistId,
+      role,
+    })
+  }
+
+  // Add album from releases (pick best match using scoring)
+  const releases = bestRecording.releases || []
+  let targetRelease: typeof releases[0] | undefined = undefined
+
+  if (releases.length > 0) {
+    const normalizedAlbum = albumName ? normalizeForComparison(albumName) : null
+
+    // Score each release
+    const scoredReleases = releases.map(release => {
+      let score = 0
+      const normalizedReleaseTitle = normalizeForComparison(release.title)
+      const primaryType = release['release-group']?.['primary-type']
+
+      // Album name matching (most important when album is provided)
+      if (normalizedAlbum) {
+        if (normalizedReleaseTitle === normalizedAlbum) {
+          score += 200 // Exact match - very strong signal
+        } else if (normalizedReleaseTitle.includes(normalizedAlbum) || normalizedAlbum.includes(normalizedReleaseTitle)) {
+          score += 80 // Partial match
+        } else {
+          // Album name provided but doesn't match - penalize heavily
+          score -= 100
+        }
+      }
+
+      // Bonus for official releases
+      if (release.status === 'Official') {
+        score += 15
+      }
+
+      // Penalize compilations, soundtracks, live albums heavily
+      if (isAlternateRelease(release)) {
+        score -= 150
+      }
+
+      // Extra penalty for soundtracks specifically
+      if (isSoundtrackRelease(release.title)) {
+        score -= 100
+      }
+
+      // Prefer original Albums over Singles/EPs
+      if (primaryType === 'Album') {
+        score += 30
+      } else if (primaryType === 'Single') {
+        score += 5
+      } else if (primaryType === 'EP') {
+        score += 10
+      }
+
+      return { release, score }
+    })
+
+    // Sort by score and pick best
+    scoredReleases.sort((a, b) => b.score - a.score)
+    targetRelease = scoredReleases[0]?.release
+
+    // Log top 3 releases for debugging
+    console.log('[MusicBrainz] Release scoring (top 3):')
+    scoredReleases.slice(0, 3).forEach((sr, i) => {
+      const type = sr.release['release-group']?.['primary-type'] || 'Unknown'
+      const secondary = sr.release['release-group']?.['secondary-types']?.join(', ') || ''
+      console.log(`  ${i + 1}. "${sr.release.title}" [${type}${secondary ? '/' + secondary : ''}] (score: ${sr.score})`)
+    })
+  }
+
+  if (targetRelease) {
+    const albumId = `release-${targetRelease.id}`
+    if (!entityIds.has(albumId)) {
+      entities.push({
+        id: albumId,
+        mbid: targetRelease.id,
+        name: targetRelease.title,
+        type: 'album',
+        releaseType: mapPrimaryType(targetRelease['release-group']?.['primary-type']),
+        isExpanded: false,
+        isHidden: false,
+        childrenLoaded: false,
+      })
+      entityIds.add(albumId)
+    }
+
+    // Album -> Track relationship (album contains track)
+    relationships.push({
+      id: `rel-${albumId}-${trackId}`,
+      source: albumId,
+      target: trackId,
+      role: 'contains',
+    })
+
+    // Connect only PRIMARY artists to album (not featured artists)
+    // This correctly handles:
+    // - Single artist albums: "Graduation" -> Kanye West
+    // - Collaborative albums: "Watch The Throne" -> Kanye West AND Jay-Z (both primary)
+    // - Tracks with features: Featured artists only connect to the track, not album
+    for (const artistId of albumArtistIds) {
+      relationships.push({
+        id: `rel-${artistId}-${albumId}`,
+        source: artistId,
+        target: albumId,
+        role: 'released_on',
+      })
+    }
+  }
+
+  // Add personnel from relations (already fetched with full recording details)
+  console.log('[MusicBrainz] Processing personnel relations...')
+  try {
+    // Add personnel from relations
+    for (const rel of fullRecording.relations || []) {
+      if (rel.artist) {
+        const personnelId = `artist-${rel.artist.id}`
+
+        // Skip if this is already a primary artist (don't duplicate)
+        if (primaryArtistIds.has(personnelId)) {
+          // But still add the specific role relationship if it's different
+          const role = mapMBRelationType(rel.type, rel.attributes)
+          if (role !== 'primary_artist') {
+            relationships.push({
+              id: `rel-${trackId}-${personnelId}-${rel.type}`,
+              source: trackId,
+              target: personnelId,
+              role,
+            })
+          }
+          continue
+        }
+
+        if (!entityIds.has(personnelId)) {
+          entities.push({
+            id: personnelId,
+            mbid: rel.artist.id,
+            name: rel.artist.name,
+            type: 'artist',
+            isExpanded: false,
+            isHidden: false,
+            childrenLoaded: false,
+          })
+          entityIds.add(personnelId)
+        }
+
+        // Add relationship with specific role
+        const role = mapMBRelationType(rel.type, rel.attributes)
+        relationships.push({
+          id: `rel-${trackId}-${personnelId}-${rel.type}`,
+          source: trackId,
+          target: personnelId,
+          role,
+        })
+      }
+    }
+
+    // Process work relations to get songwriter/composer credits
+    // Work relations link the recording to a "work" (the composition)
+    // The work itself has artist relations like composer, lyricist, writer
+    const workRelations = (fullRecording.relations || []).filter(rel => rel.work)
+    if (workRelations.length > 0) {
+      console.log(`[MusicBrainz] Found ${workRelations.length} work relation(s), fetching songwriter credits...`)
+
+      for (const workRel of workRelations) {
+        if (!workRel.work) continue
+
+        try {
+          // Fetch the work's artist relations
+          const workData = await fetchMB<{
+            id: string
+            title: string
+            relations?: MBRelation[]
+          }>(`/work/${workRel.work.id}`, {
+            inc: 'artist-rels',
+          })
+
+          if (workData.relations) {
+            console.log(`[MusicBrainz] Work "${workData.title}" has ${workData.relations.length} artist relation(s)`)
+
+            for (const rel of workData.relations) {
+              if (!rel.artist) continue
+
+              const personnelId = `artist-${rel.artist.id}`
+
+              // Map work relation types to roles
+              // composer, lyricist, writer -> songwriter
+              const workRole = rel.type.toLowerCase()
+              let role: Relationship['role'] = 'songwriter'
+              if (workRole === 'composer' || workRole === 'music by' || workRole === 'composed by') {
+                role = 'songwriter'
+              } else if (workRole === 'lyricist' || workRole === 'lyrics by') {
+                role = 'songwriter'
+              } else if (workRole === 'writer' || workRole === 'written by') {
+                role = 'songwriter'
+              }
+
+              // Skip if this exact relationship already exists
+              const relId = `rel-${trackId}-${personnelId}-${rel.type}`
+              if (relationships.some(r => r.id === relId)) continue
+
+              // Add the artist entity if not already present
+              if (!entityIds.has(personnelId)) {
+                entities.push({
+                  id: personnelId,
+                  mbid: rel.artist.id,
+                  name: rel.artist.name,
+                  type: 'artist',
+                  isExpanded: false,
+                  isHidden: false,
+                  childrenLoaded: false,
+                })
+                entityIds.add(personnelId)
+              }
+
+              relationships.push({
+                id: relId,
+                source: trackId,
+                target: personnelId,
+                role,
+              })
+
+              console.log(`[MusicBrainz] Added ${rel.type}: ${rel.artist.name}`)
+            }
+          }
+        } catch (e) {
+          console.warn(`[MusicBrainz] Failed to fetch work relations for ${workRel.work.id}:`, e)
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[MusicBrainz] Failed to fetch personnel:', e)
+    // Continue without personnel - we still have the basic graph
+  }
+
+  console.log(`[MusicBrainz] Flat graph: ${entities.length} entities, ${relationships.length} relationships`)
+
+  // Always try Discogs to supplement MusicBrainz credits
+  // Discogs often has additional credits like session musicians, mixing engineers, etc.
+  if (isDiscogsConfigured()) {
+    console.log('[MusicBrainz] Fetching additional credits from Discogs...')
+
+    try {
+      const discogsCredits = await getDiscogsCredits(trackName, artistName, albumName, trackId)
+
+      if (discogsCredits.entities.length > 0) {
+        console.log(`[Discogs] Found ${discogsCredits.entities.length} additional credits`)
+
+        // Merge Discogs entities, avoiding duplicates by name
+        const existingNames = new Set(entities.map(e => e.name.toLowerCase()))
+        for (const entity of discogsCredits.entities) {
+          if (!existingNames.has(entity.name.toLowerCase())) {
+            entities.push(entity)
+            existingNames.add(entity.name.toLowerCase())
+            entityIds.add(entity.id)
+          }
+        }
+
+        // Merge relationships, mapping Discogs artist IDs to existing entities where possible
+        for (const rel of discogsCredits.relationships) {
+          // Try to find existing entity with same name
+          const discogsEntity = discogsCredits.entities.find(e => e.id === rel.target)
+          if (discogsEntity) {
+            const existingEntity = entities.find(e =>
+              e.name.toLowerCase() === discogsEntity.name.toLowerCase() && e.type === 'artist'
+            )
+            if (existingEntity && existingEntity.id !== rel.target) {
+              // Remap to existing entity
+              rel.target = existingEntity.id
+              rel.id = `rel-${trackId}-${existingEntity.id}-${rel.role}-discogs`
+            }
+          }
+
+          // Ensure source is our track
+          rel.source = trackId
+
+          // Check for duplicate relationships
+          const isDuplicate = relationships.some(r =>
+            r.source === rel.source && r.target === rel.target && r.role === rel.role
+          )
+          if (!isDuplicate) {
+            relationships.push(rel)
+          }
+        }
+
+        console.log(`[Discogs] Merged credits. Total: ${entities.length} entities, ${relationships.length} relationships`)
+      }
+    } catch (e) {
+      console.warn('[Discogs] Fallback failed:', e)
+      // Continue without Discogs data
+    }
+  }
+
+  // Fetch images for artists and album (in parallel, non-blocking)
+  console.log('[MusicBrainz] Fetching images...')
+  try {
+    const imagePromises: Promise<void>[] = []
+
+    // Get all artist entities that need images
+    const artistEntities = entities.filter(e => e.type === 'artist' && !e.image)
+
+    // Prioritize: primary artists first, then others (limit to avoid rate limiting)
+    const primaryArtists = artistEntities.filter(e => primaryArtistIds.has(e.id))
+    const otherArtists = artistEntities.filter(e => !primaryArtistIds.has(e.id))
+
+    // Fetch primary artists first (no limit) - use TheAudioDB with MBID for accuracy
+    for (const entity of primaryArtists) {
+      imagePromises.push(
+        getArtistImageWithMBID(entity.name, entity.mbid).then(image => {
+          if (image) entity.image = image
+        }).catch(() => {})
+      )
+    }
+
+    // Fetch up to 5 additional artists (producers, featured, etc.)
+    const additionalArtistsLimit = 5
+    for (const entity of otherArtists.slice(0, additionalArtistsLimit)) {
+      imagePromises.push(
+        getArtistImageWithMBID(entity.name, entity.mbid).then(image => {
+          if (image) entity.image = image
+        }).catch(() => {})
+      )
+    }
+
+    // Fetch album image (use album artist, not featured artist)
+    const albumEntity = entities.find(e => e.type === 'album')
+    if (albumEntity && !albumEntity.image) {
+      const albumArtist = entities.find(e => albumArtistIds.has(e.id))
+      if (albumArtist) {
+        imagePromises.push(
+          getAlbumImage(albumArtist.name, albumEntity.name).then(image => {
+            if (image) albumEntity.image = image
+          }).catch(() => {})
+        )
+      }
+    }
+
+    // Wait for all images (with a longer timeout since TheAudioDB rate limits to 1 req/2sec)
+    // With up to 6-7 artist images + 1 album, we need ~15 seconds
+    await Promise.race([
+      Promise.all(imagePromises),
+      new Promise(resolve => setTimeout(resolve, 15000)) // 15 second timeout
+    ])
+
+    // Copy album art to track (tracks don't have their own images)
+    const trackEntity = entities.find(e => e.type === 'track')
+    const albumEntityForTrack = entities.find(e => e.type === 'album')
+    if (trackEntity && albumEntityForTrack?.image && !trackEntity.image) {
+      trackEntity.image = albumEntityForTrack.image
+    }
+
+    console.log(`[MusicBrainz] Images fetched for ${imagePromises.length} entities`)
+  } catch (e) {
+    console.warn('[MusicBrainz] Failed to fetch some images:', e)
+  }
+
+  // Cache the result for future use
+  const result = { entities, relationships }
+  setCachedTrack(trackName, artistName, albumName, entities, relationships)
+
+  return result
+}
+
+export async function getArtistRelations(artistId: string): Promise<MusicGraph> {
+  const data = await fetchMB<{ relations: MBRelation[] }>(`/artist/${artistId}`, {
+    inc: 'artist-rels+recording-rels+release-rels',
+  })
+
+  const entities: MusicEntity[] = []
+  const relationships: Relationship[] = []
+  const entityIds = new Set<string>()
+
+  // Add the main artist
+  const mainArtist = await fetchMB<MBArtist>(`/artist/${artistId}`, {})
+  entities.push({
+    id: `artist-${artistId}`,
+    name: mainArtist.name,
+    type: 'artist',
+  })
+  entityIds.add(`artist-${artistId}`)
+
+  // Process relations
+  for (const rel of data.relations || []) {
+    if (rel.artist && !entityIds.has(`artist-${rel.artist.id}`)) {
+      entities.push({
+        id: `artist-${rel.artist.id}`,
+        name: rel.artist.name,
+        type: 'artist',
+      })
+      entityIds.add(`artist-${rel.artist.id}`)
+
+      relationships.push({
+        id: `rel-${relationships.length}`,
+        source: `artist-${artistId}`,
+        target: `artist-${rel.artist.id}`,
+        role: mapMBRelationType(rel.type, rel.attributes),
+      })
+    }
+
+    if (rel.recording && !entityIds.has(`track-${rel.recording.id}`)) {
+      entities.push({
+        id: `track-${rel.recording.id}`,
+        name: rel.recording.title,
+        type: 'track',
+      })
+      entityIds.add(`track-${rel.recording.id}`)
+
+      relationships.push({
+        id: `rel-${relationships.length}`,
+        source: `track-${rel.recording.id}`,
+        target: `artist-${artistId}`,
+        role: mapMBRelationType(rel.type, rel.attributes),
+      })
+    }
+  }
+
+  return { entities, relationships }
+}
+
+export async function getRecordingCredits(recordingId: string): Promise<MusicGraph> {
+  const data = await fetchMB<{
+    title: string
+    relations: MBRelation[]
+    'artist-credit': Array<{ artist: MBArtist }>
+  }>(`/recording/${recordingId}`, {
+    inc: 'artist-credits+artist-rels',
+  })
+
+  const entities: MusicEntity[] = []
+  const relationships: Relationship[] = []
+  const entityIds = new Set<string>()
+
+  // Add the track
+  entities.push({
+    id: `track-${recordingId}`,
+    name: data.title,
+    type: 'track',
+  })
+  entityIds.add(`track-${recordingId}`)
+
+  // Add credited artists
+  for (const credit of data['artist-credit'] || []) {
+    const artistId = `artist-${credit.artist.id}`
+    if (!entityIds.has(artistId)) {
+      entities.push({
+        id: artistId,
+        name: credit.artist.name,
+        type: 'artist',
+      })
+      entityIds.add(artistId)
+    }
+
+    relationships.push({
+      id: `rel-${relationships.length}`,
+      source: `track-${recordingId}`,
+      target: artistId,
+      role: 'primary_artist',
+    })
+  }
+
+  // Add related artists
+  for (const rel of data.relations || []) {
+    if (rel.artist) {
+      const artistId = `artist-${rel.artist.id}`
+      if (!entityIds.has(artistId)) {
+        entities.push({
+          id: artistId,
+          name: rel.artist.name,
+          type: 'artist',
+        })
+        entityIds.add(artistId)
+      }
+
+      relationships.push({
+        id: `rel-${relationships.length}`,
+        source: `track-${recordingId}`,
+        target: artistId,
+        role: mapMBRelationType(rel.type, rel.attributes),
+      })
+    }
+  }
+
+  return { entities, relationships }
+}
+
+function mapMBRelationType(mbType: string, attributes?: string[]): Relationship['role'] {
+  const lowerType = mbType.toLowerCase()
+
+  // Handle producer with attributes for stratification
+  if (lowerType === 'producer') {
+    const attrs = (attributes || []).map(a => a.toLowerCase())
+
+    if (attrs.includes('executive')) {
+      return 'executive_producer'
+    }
+    if (attrs.includes('co')) {
+      return 'co_producer'
+    }
+    if (attrs.some(a => a.includes('vocal'))) {
+      return 'vocal_producer'
+    }
+    if (attrs.includes('additional')) {
+      return 'additional_producer'
+    }
+    return 'producer'
+  }
+
+  const typeMap: Record<string, Relationship['role']> = {
+    'vocal': 'vocals',
+    'lead vocals': 'vocals',
+    'background vocals': 'vocals',
+    'guitar': 'guitar',
+    'bass': 'bass',
+    'bass guitar': 'bass',
+    'drums': 'drums',
+    'drums (drum set)': 'drums',
+    'keyboard': 'keyboards',
+    'keyboards': 'keyboards',
+    'piano': 'keyboards',
+    'mix': 'engineer',
+    'engineer': 'engineer',
+    'recording': 'engineer',
+    'writer': 'songwriter',
+    'composer': 'songwriter',
+    'lyricist': 'songwriter',
+    'member of band': 'member_of',
+    'is person': 'member_of',
+  }
+
+  return typeMap[lowerType] || 'featured'
+}
+
+export async function searchAndBuildGraph(query: string): Promise<MusicGraph> {
+  const artists = await searchArtist(query)
+  if (artists.length === 0) {
+    return { entities: [], relationships: [] }
+  }
+
+  // Get the first matching artist's relations
+  return getArtistRelations(artists[0]!.id)
+}
+
+// ============================================
+// DRILL-DOWN NAVIGATION FUNCTIONS
+// ============================================
+
+function mapPrimaryType(mbType?: string): ReleaseType {
+  if (!mbType) return 'Other'
+  const type = mbType.toLowerCase()
+  if (type === 'album') return 'Album'
+  if (type === 'single') return 'Single'
+  if (type === 'ep') return 'EP'
+  return 'Other'
+}
+
+/**
+ * Get all release groups for an artist, grouped by type
+ */
+export async function getArtistReleases(artistMbid: string): Promise<{
+  albums: MBReleaseGroup[]
+  singles: MBReleaseGroup[]
+  eps: MBReleaseGroup[]
+  other: MBReleaseGroup[]
+}> {
+  console.log('[MusicBrainz] Getting releases for artist:', artistMbid)
+
+  const data = await fetchMB<{ 'release-groups': MBReleaseGroup[] }>(
+    '/release-group',
+    { artist: artistMbid, limit: '100' }
+  )
+
+  const groups = {
+    albums: [] as MBReleaseGroup[],
+    singles: [] as MBReleaseGroup[],
+    eps: [] as MBReleaseGroup[],
+    other: [] as MBReleaseGroup[],
+  }
+
+  for (const rg of data['release-groups'] || []) {
+    const type = rg['primary-type']?.toLowerCase()
+    if (type === 'album') groups.albums.push(rg)
+    else if (type === 'single') groups.singles.push(rg)
+    else if (type === 'ep') groups.eps.push(rg)
+    else groups.other.push(rg)
+  }
+
+  console.log(`[MusicBrainz] Found ${groups.albums.length} albums, ${groups.singles.length} singles, ${groups.eps.length} EPs`)
+  return groups
+}
+
+/**
+ * Get all recordings (tracks) for a release group
+ * We need to first get releases in the group, then get tracks from the first release
+ */
+export async function getReleaseRecordings(releaseGroupMbid: string): Promise<MBRecording[]> {
+  console.log('[MusicBrainz] Getting recordings for release group:', releaseGroupMbid)
+
+  // First, get releases in this release group
+  const releasesData = await fetchMB<{ releases: Array<{ id: string; date?: string }> }>(
+    '/release',
+    { 'release-group': releaseGroupMbid, limit: '10' }
+  )
+
+  const releases = releasesData.releases || []
+  if (releases.length === 0) {
+    console.log('[MusicBrainz] No releases found for release group')
+    return []
+  }
+
+  // Get the first (or most complete) release's tracks
+  // Sort by date to get earliest official release
+  releases.sort((a, b) => (a.date || '').localeCompare(b.date || ''))
+  const releaseId = releases[0]!.id
+
+  // Get tracks from this release
+  const releaseData = await fetchMB<{ media: MBMedium[] }>(
+    `/release/${releaseId}`,
+    { inc: 'recordings+artist-credits' }
+  )
+
+  const recordings: MBRecording[] = []
+  for (const medium of releaseData.media || []) {
+    for (const track of medium.tracks || []) {
+      recordings.push(track.recording)
+    }
+  }
+
+  console.log(`[MusicBrainz] Found ${recordings.length} tracks`)
+  return recordings
+}
+
+/**
+ * Initialize the graph with an artist and their releases (albums, singles, EPs)
+ * This is the entry point for drill-down navigation
+ */
+export async function initializeArtistGraph(artistName: string): Promise<DrillDownResult> {
+  console.log('[MusicBrainz] Initializing graph for:', artistName)
+
+  // Search for the artist
+  const artists = await searchArtist(artistName)
+  if (artists.length === 0) {
+    throw new Error('Artist not found')
+  }
+
+  const artist = artists[0]!
+  const artistId = `artist-${artist.id}`
+
+  // Create artist entity
+  const artistEntity: MusicEntity = {
+    id: artistId,
+    mbid: artist.id,
+    name: artist.name,
+    type: 'artist',
+    depth: 0,
+    isExpanded: true,
+    isHidden: false,
+    childrenLoaded: true,
+  }
+
+  // Get releases
+  const releases = await getArtistReleases(artist.id)
+  const allReleases = [
+    ...releases.albums,
+    ...releases.singles,
+    ...releases.eps,
+  ]
+
+  artistEntity.childCount = allReleases.length
+
+  // Create release entities
+  const releaseEntities: MusicEntity[] = allReleases.map(rg => ({
+    id: `release-${rg.id}`,
+    mbid: rg.id,
+    name: rg.title,
+    type: 'album' as const,
+    releaseType: mapPrimaryType(rg['primary-type']),
+    parentId: artistId,
+    depth: 1,
+    isExpanded: false,
+    isHidden: false,
+    childrenLoaded: false,
+    metadata: rg['first-release-date'] ? { releaseDate: rg['first-release-date'] } : undefined,
+  }))
+
+  // Create relationships (artist -> releases)
+  const relationships: Relationship[] = releaseEntities.map((release) => ({
+    id: `rel-${artistId}-${release.id}`,
+    source: artistId,
+    target: release.id,
+    role: 'released_on' as const,
+  }))
+
+  console.log(`[MusicBrainz] Graph initialized: 1 artist, ${releaseEntities.length} releases`)
+
+  return {
+    entities: [artistEntity, ...releaseEntities],
+    relationships,
+  }
+}
+
+/**
+ * Expand a release to show its tracks
+ */
+export async function expandRelease(releaseEntity: MusicEntity): Promise<DrillDownResult> {
+  if (!releaseEntity.mbid) {
+    throw new Error('Release has no MusicBrainz ID')
+  }
+
+  console.log('[MusicBrainz] Expanding release:', releaseEntity.name)
+
+  const recordings = await getReleaseRecordings(releaseEntity.mbid)
+
+  const trackEntities: MusicEntity[] = recordings.map(rec => ({
+    id: `track-${rec.id}`,
+    mbid: rec.id,
+    name: rec.title,
+    type: 'track' as const,
+    parentId: releaseEntity.id,
+    depth: 2,
+    isExpanded: false,
+    isHidden: false,
+    childrenLoaded: false,
+  }))
+
+  const relationships: Relationship[] = trackEntities.map(track => ({
+    id: `rel-${releaseEntity.id}-${track.id}`,
+    source: releaseEntity.id,
+    target: track.id,
+    role: 'contains' as const,
+  }))
+
+  console.log(`[MusicBrainz] Expanded release: ${trackEntities.length} tracks`)
+
+  return {
+    entities: trackEntities,
+    relationships,
+  }
+}
+
+/**
+ * Expand a track to show its personnel (credits)
+ */
+export async function expandTrack(trackEntity: MusicEntity): Promise<DrillDownResult> {
+  if (!trackEntity.mbid) {
+    throw new Error('Track has no MusicBrainz ID')
+  }
+
+  console.log('[MusicBrainz] Expanding track:', trackEntity.name)
+
+  const data = await fetchMB<{
+    title: string
+    relations?: MBRelation[]
+    'artist-credit'?: Array<{ artist: MBArtist; joinphrase?: string }>
+  }>(`/recording/${trackEntity.mbid}`, {
+    inc: 'artist-credits+artist-rels+work-rels',
+  })
+
+  const entities: MusicEntity[] = []
+  const relationships: Relationship[] = []
+  const seenArtists = new Set<string>()
+
+  // Add credited artists (primary and featured)
+  // MusicBrainz uses joinphrase to indicate featured artists
+  const artistCredits = data['artist-credit'] || []
+  let nextIsFeatured = false
+
+  for (let i = 0; i < artistCredits.length; i++) {
+    const credit = artistCredits[i]!
+    const artistId = `artist-${credit.artist.id}`
+
+    // Determine if this artist is featured based on the PREVIOUS joinphrase
+    const isFeatured = nextIsFeatured
+
+    // Check if the joinphrase indicates the NEXT artist is featured
+    const joinphrase = (credit.joinphrase || '').toLowerCase()
+    nextIsFeatured = joinphrase.includes('feat') ||
+                     joinphrase.includes('ft.') ||
+                     joinphrase.includes('featuring') ||
+                     joinphrase.includes('with ')
+
+    if (!seenArtists.has(artistId)) {
+      entities.push({
+        id: artistId,
+        mbid: credit.artist.id,
+        name: credit.artist.name,
+        type: 'artist',
+        parentId: trackEntity.id,
+        depth: 3,
+        isExpanded: false,
+        isHidden: false,
+        childrenLoaded: false, // Leaf node for now
+      })
+      seenArtists.add(artistId)
+    }
+
+    const role = isFeatured ? 'featured' : 'primary_artist'
+    relationships.push({
+      id: `rel-${trackEntity.id}-${artistId}-${role}`,
+      source: trackEntity.id,
+      target: artistId,
+      role,
+    })
+  }
+
+  // Add related artists (producers, engineers, etc.)
+  for (const rel of data.relations || []) {
+    if (rel.artist) {
+      const artistId = `artist-${rel.artist.id}`
+      if (!seenArtists.has(artistId)) {
+        entities.push({
+          id: artistId,
+          mbid: rel.artist.id,
+          name: rel.artist.name,
+          type: 'artist',
+          parentId: trackEntity.id,
+          depth: 3,
+          isExpanded: false,
+          isHidden: false,
+          childrenLoaded: false,
+        })
+        seenArtists.add(artistId)
+      }
+
+      relationships.push({
+        id: `rel-${trackEntity.id}-${artistId}-${rel.type}`,
+        source: trackEntity.id,
+        target: artistId,
+        role: mapMBRelationType(rel.type, rel.attributes),
+      })
+    }
+  }
+
+  console.log(`[MusicBrainz] Expanded track: ${entities.length} personnel`)
+
+  return {
+    entities,
+    relationships,
+  }
+}
