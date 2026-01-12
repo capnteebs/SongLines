@@ -506,16 +506,27 @@ export async function buildGraphFromTrack(
   const bestRecording = scoredRecordings[0]!.recording
   const recordingMbid = bestRecording.id
 
-  // Fetch FULL recording details to get complete artist credits
-  // Search results may have incomplete/abbreviated artist credits
+  // Fetch FULL recording details to get complete artist credits AND releases
+  // Search results may have incomplete/abbreviated data
   console.log('[MusicBrainz] Fetching full recording details for:', recordingMbid)
   const fullRecording = await fetchMB<{
     id: string
     title: string
     'artist-credit'?: Array<{ artist: MBArtist; joinphrase?: string }>
     relations?: MBRelation[]
+    releases?: Array<{
+      id: string
+      title: string
+      status?: string
+      date?: string
+      'release-group'?: {
+        id: string
+        'primary-type'?: string
+        'secondary-types'?: string[]
+      }
+    }>
   }>(`/recording/${recordingMbid}`, {
-    inc: 'artist-credits+artist-rels+work-rels',
+    inc: 'artist-credits+artist-rels+work-rels+releases+release-groups',
   })
 
   // Create track entity
@@ -601,10 +612,36 @@ export async function buildGraphFromTrack(
   }
 
   // Add album from releases (pick best match using scoring)
-  const releases = bestRecording.releases || []
-  let targetRelease: typeof releases[0] | undefined = undefined
+  // Use full recording's releases (more complete than search results)
+  // Also track if this track was released as a single (for artwork)
+  const releases = fullRecording.releases || bestRecording.releases || []
+  let targetRelease: typeof bestRecording.releases[0] | undefined = undefined
+  let singleRelease: { id: string; title: string; status?: string; date?: string; 'release-group'?: { id: string; 'primary-type'?: string; 'secondary-types'?: string[] } } | undefined = undefined
 
   if (releases.length > 0) {
+    // Debug: log all releases and their types
+    console.log(`[MusicBrainz] Recording has ${releases.length} releases:`)
+    for (const r of releases.slice(0, 10)) { // Limit to first 10 for readability
+      const type = r['release-group']?.['primary-type'] || 'unknown'
+      console.log(`  - "${r.title}" [${type}]`)
+    }
+    if (releases.length > 10) {
+      console.log(`  ... and ${releases.length - 10} more`)
+    }
+
+    // First, find if there's a single release for this track
+    const singleReleases = releases.filter(r =>
+      r['release-group']?.['primary-type'] === 'Single' &&
+      !isAlternateRelease(r as MBRecordingRelease)
+    )
+    if (singleReleases.length > 0) {
+      // Pick the earliest single (original release) - sort by date
+      singleReleases.sort((a, b) => (a.date || '9999').localeCompare(b.date || '9999'))
+      singleRelease = singleReleases[0]
+      console.log(`[MusicBrainz] Track has single release: "${singleRelease!.title}"`)
+    } else {
+      console.log(`[MusicBrainz] No single release found for this track`)
+    }
     const normalizedAlbum = albumName ? normalizeForComparison(albumName) : null
 
     // Score each release
@@ -946,11 +983,27 @@ export async function buildGraphFromTrack(
       new Promise(resolve => setTimeout(resolve, 15000)) // 15 second timeout
     ])
 
-    // Copy album art to track (tracks don't have their own images)
+    // Fetch track image: prefer single artwork if track was released as a single
     const trackEntity = entities.find(e => e.type === 'track')
     const albumEntityForTrack = entities.find(e => e.type === 'album')
-    if (trackEntity && albumEntityForTrack?.image && !trackEntity.image) {
-      trackEntity.image = albumEntityForTrack.image
+
+    if (trackEntity && !trackEntity.image) {
+      if (singleRelease) {
+        // Track was released as a single - fetch single's cover art
+        const singleArtist = entities.find(e => albumArtistIds.has(e.id))
+        if (singleArtist) {
+          const singleImage = await getAlbumImage(singleArtist.name, singleRelease.title).catch(() => undefined)
+          if (singleImage) {
+            trackEntity.image = singleImage
+            console.log(`[MusicBrainz] Using single artwork for track: "${singleRelease.title}"`)
+          }
+        }
+      }
+
+      // Fall back to album art if no single image found
+      if (!trackEntity.image && albumEntityForTrack?.image) {
+        trackEntity.image = albumEntityForTrack.image
+      }
     }
 
     console.log(`[MusicBrainz] Images fetched for ${imagePromises.length} entities`)
