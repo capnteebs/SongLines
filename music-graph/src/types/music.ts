@@ -3,20 +3,56 @@ export type EntityType = 'artist' | 'track' | 'album' | 'label'
 export type ReleaseType = 'Album' | 'Single' | 'EP' | 'Other'
 
 export type RoleType =
+  // Artist roles
   | 'primary_artist'
   | 'featured'
+  | 'remixer'
+  // Production
   | 'producer'
   | 'executive_producer'
   | 'co_producer'
   | 'vocal_producer'
   | 'additional_producer'
+  // Songwriting
   | 'songwriter'
+  | 'composer'
+  | 'lyricist'
+  | 'arranger'
+  // Engineering
   | 'engineer'
+  | 'mixing'
+  | 'mastering'
+  | 'recording'
+  | 'programming'
+  // Vocals
   | 'vocals'
+  | 'background_vocals'
+  | 'choir'
+  // String instruments
   | 'guitar'
   | 'bass'
+  | 'violin'
+  | 'cello'
+  | 'strings'
+  // Rhythm
   | 'drums'
+  | 'percussion'
+  // Keys
   | 'keyboards'
+  | 'piano'
+  | 'organ'
+  | 'synthesizer'
+  // Brass & Woodwinds
+  | 'saxophone'
+  | 'trumpet'
+  | 'horns'
+  | 'flute'
+  | 'woodwinds'
+  // Other instruments
+  | 'harmonica'
+  | 'turntables'
+  | 'other_instrument'
+  // Relationships
   | 'member_of'
   | 'signed_to'
   | 'released_on'

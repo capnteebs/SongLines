@@ -12,20 +12,56 @@ const emit = defineEmits<{
 }>()
 
 const roleLabels: Record<RoleType, string> = {
+  // Artist roles
   primary_artist: 'Primary Artist',
   featured: 'Featured',
+  remixer: 'Remixer',
+  // Production
   producer: 'Producer',
   executive_producer: 'Executive Producer',
   co_producer: 'Co-Producer',
   vocal_producer: 'Vocal Producer',
   additional_producer: 'Additional Producer',
+  // Songwriting
   songwriter: 'Songwriter',
+  composer: 'Composer',
+  lyricist: 'Lyricist',
+  arranger: 'Arranger',
+  // Engineering
   engineer: 'Engineer',
+  mixing: 'Mixing',
+  mastering: 'Mastering',
+  recording: 'Recording',
+  programming: 'Programming',
+  // Vocals
   vocals: 'Vocals',
+  background_vocals: 'Background Vocals',
+  choir: 'Choir',
+  // Strings
   guitar: 'Guitar',
   bass: 'Bass',
+  violin: 'Violin',
+  cello: 'Cello',
+  strings: 'Strings',
+  // Rhythm
   drums: 'Drums',
+  percussion: 'Percussion',
+  // Keys
   keyboards: 'Keyboards',
+  piano: 'Piano',
+  organ: 'Organ',
+  synthesizer: 'Synthesizer',
+  // Brass & Woodwinds
+  saxophone: 'Saxophone',
+  trumpet: 'Trumpet',
+  horns: 'Horns',
+  flute: 'Flute',
+  woodwinds: 'Woodwinds',
+  // Other
+  harmonica: 'Harmonica',
+  turntables: 'Turntables',
+  other_instrument: 'Other',
+  // Relationships
   member_of: 'Member of',
   signed_to: 'Signed to',
   released_on: 'Released on',
@@ -33,20 +69,56 @@ const roleLabels: Record<RoleType, string> = {
 }
 
 const roleColors: Record<RoleType, string> = {
+  // Artist roles - reds/corals
   primary_artist: '#ff6b6b',
   featured: '#4ecdc4',
+  remixer: '#e056fd',
+  // Production - yellows/golds
   producer: '#ffe66d',
   executive_producer: '#ffd93d',
   co_producer: '#ffec8b',
   vocal_producer: '#fff4a3',
   additional_producer: '#fff9c4',
+  // Songwriting - greens
   songwriter: '#95e1d3',
+  composer: '#7bed9f',
+  lyricist: '#a3de83',
+  arranger: '#b8e994',
+  // Engineering - blues
   engineer: '#a8d8ea',
+  mixing: '#74b9ff',
+  mastering: '#81ecec',
+  recording: '#a29bfe',
+  programming: '#6c5ce7',
+  // Vocals - pinks/reds
   vocals: '#f38181',
+  background_vocals: '#fab1a0',
+  choir: '#fd79a8',
+  // Strings - purples
   guitar: '#aa96da',
   bass: '#fcbad3',
-  drums: '#a8d8ea',
+  violin: '#c39bd3',
+  cello: '#bb8fce',
+  strings: '#d7bde2',
+  // Rhythm - teals
+  drums: '#48dbfb',
+  percussion: '#00d2d3',
+  // Keys - warm tones
   keyboards: '#d4a5a5',
+  piano: '#dfe6e9',
+  organ: '#b2bec3',
+  synthesizer: '#00cec9',
+  // Brass & Woodwinds - oranges/bronzes
+  saxophone: '#f39c12',
+  trumpet: '#e17055',
+  horns: '#d35400',
+  flute: '#fdcb6e',
+  woodwinds: '#f8b739',
+  // Other
+  harmonica: '#78e08f',
+  turntables: '#e056fd',
+  other_instrument: '#636e72',
+  // Relationships
   member_of: '#9b59b6',
   signed_to: '#3498db',
   released_on: '#e74c3c',

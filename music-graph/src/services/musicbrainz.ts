@@ -717,12 +717,16 @@ export async function buildGraphFromTrack(
           // But still add the specific role relationship if it's different
           const role = mapMBRelationType(rel.type, rel.attributes)
           if (role !== 'primary_artist') {
-            relationships.push({
-              id: `rel-${trackId}-${personnelId}-${rel.type}`,
-              source: trackId,
-              target: personnelId,
-              role,
-            })
+            const relId = `rel-${trackId}-${personnelId}-${role}`
+            // Skip if this exact relationship already exists (deduplication)
+            if (!relationships.some(r => r.id === relId)) {
+              relationships.push({
+                id: relId,
+                source: trackId,
+                target: personnelId,
+                role,
+              })
+            }
           }
           continue
         }
@@ -740,14 +744,18 @@ export async function buildGraphFromTrack(
           entityIds.add(personnelId)
         }
 
-        // Add relationship with specific role
+        // Add relationship with specific role (use mapped role in ID to deduplicate)
         const role = mapMBRelationType(rel.type, rel.attributes)
-        relationships.push({
-          id: `rel-${trackId}-${personnelId}-${rel.type}`,
-          source: trackId,
-          target: personnelId,
-          role,
-        })
+        const relId = `rel-${trackId}-${personnelId}-${role}`
+        // Skip if this exact relationship already exists (deduplication)
+        if (!relationships.some(r => r.id === relId)) {
+          relationships.push({
+            id: relId,
+            source: trackId,
+            target: personnelId,
+            role,
+          })
+        }
       }
     }
 
@@ -1081,11 +1089,48 @@ export async function getRecordingCredits(recordingId: string): Promise<MusicGra
 
 function mapMBRelationType(mbType: string, attributes?: string[]): Relationship['role'] {
   const lowerType = mbType.toLowerCase()
+  const attrs = (attributes || []).map(a => a.toLowerCase())
+
+  // Handle "instrument" type - actual instrument is in attributes
+  if (lowerType === 'instrument' || lowerType === 'performer') {
+    // Check each attribute for instrument matches
+    for (const attr of attrs) {
+      // Drums & Percussion
+      if (attr.includes('drum')) return 'drums'
+      if (attr.includes('percuss') || attr === 'congas' || attr === 'bongos' || attr === 'tambourine' || attr === 'shaker') return 'percussion'
+      // Guitar family
+      if (attr.includes('guitar') || attr === 'banjo' || attr === 'mandolin' || attr === 'ukulele') return 'guitar'
+      // Bass
+      if (attr.includes('bass')) return 'bass'
+      // Piano specifically
+      if (attr.includes('piano') || attr === 'rhodes' || attr === 'wurlitzer') return 'piano'
+      // Synthesizer
+      if (attr.includes('synth')) return 'synthesizer'
+      // Organ
+      if (attr.includes('organ')) return 'organ'
+      // Generic keyboards
+      if (attr.includes('keyboard') || attr === 'clavinet') return 'keyboards'
+      // Strings
+      if (attr.includes('violin') || attr === 'fiddle') return 'violin'
+      if (attr.includes('cello')) return 'cello'
+      if (attr.includes('string') || attr === 'viola' || attr === 'orchestra' || attr === 'harp') return 'strings'
+      // Brass
+      if (attr.includes('trumpet')) return 'trumpet'
+      if (attr.includes('sax')) return 'saxophone'
+      if (attr.includes('horn') || attr.includes('trombone') || attr.includes('tuba') || attr === 'brass') return 'horns'
+      // Woodwinds
+      if (attr.includes('flute')) return 'flute'
+      if (attr.includes('clarinet') || attr.includes('oboe') || attr.includes('bassoon') || attr === 'woodwinds') return 'woodwinds'
+      // Other
+      if (attr.includes('harmonica')) return 'harmonica'
+      if (attr.includes('turntable') || attr === 'dj' || attr.includes('scratch')) return 'turntables'
+    }
+    // Unknown instrument
+    return 'other_instrument'
+  }
 
   // Handle producer with attributes for stratification
   if (lowerType === 'producer') {
-    const attrs = (attributes || []).map(a => a.toLowerCase())
-
     if (attrs.includes('executive')) {
       return 'executive_producer'
     }
@@ -1101,29 +1146,175 @@ function mapMBRelationType(mbType: string, attributes?: string[]): Relationship[
     return 'producer'
   }
 
+  // Handle vocal with attributes for background vocals
+  if (lowerType === 'vocal') {
+    if (attrs.some(a => a.includes('background') || a.includes('backing'))) {
+      return 'background_vocals'
+    }
+    if (attrs.some(a => a.includes('choir') || a.includes('chorus'))) {
+      return 'choir'
+    }
+    return 'vocals'
+  }
+
   const typeMap: Record<string, Relationship['role']> = {
+    // Vocals
     'vocal': 'vocals',
     'lead vocals': 'vocals',
-    'background vocals': 'vocals',
+    'background vocals': 'background_vocals',
+    'backing vocals': 'background_vocals',
+    'guest': 'featured',
+    'choir': 'choir',
+    'chorus': 'choir',
+    // Guitar
     'guitar': 'guitar',
+    'electric guitar': 'guitar',
+    'acoustic guitar': 'guitar',
+    'rhythm guitar': 'guitar',
+    'lead guitar': 'guitar',
+    'classical guitar': 'guitar',
+    '12-string guitar': 'guitar',
+    // Bass
     'bass': 'bass',
     'bass guitar': 'bass',
+    'electric bass guitar': 'bass',
+    'double bass': 'bass',
+    'upright bass': 'bass',
+    'fretless bass': 'bass',
+    // Drums & Percussion
     'drums': 'drums',
     'drums (drum set)': 'drums',
+    'drum machine': 'drums',
+    'percussion': 'percussion',
+    'congas': 'percussion',
+    'bongos': 'percussion',
+    'tambourine': 'percussion',
+    'shaker': 'percussion',
+    'timpani': 'percussion',
+    // Piano
+    'piano': 'piano',
+    'grand piano': 'piano',
+    'electric piano': 'piano',
+    'rhodes': 'piano',
+    'wurlitzer': 'piano',
+    'clavinet': 'keyboards',
+    // Keyboards & Synths
     'keyboard': 'keyboards',
     'keyboards': 'keyboards',
-    'piano': 'keyboards',
-    'mix': 'engineer',
+    'synthesizer': 'synthesizer',
+    'synth': 'synthesizer',
+    'analog synthesizer': 'synthesizer',
+    'digital synthesizer': 'synthesizer',
+    'modular synthesizer': 'synthesizer',
+    // Organ
+    'organ': 'organ',
+    'hammond organ': 'organ',
+    'pipe organ': 'organ',
+    // Strings
+    'violin': 'violin',
+    'viola': 'strings',
+    'cello': 'cello',
+    'strings': 'strings',
+    'string section': 'strings',
+    'orchestra': 'strings',
+    'orchestration': 'arranger',
+    // Brass
+    'trumpet': 'trumpet',
+    'trombone': 'horns',
+    'french horn': 'horns',
+    'tuba': 'horns',
+    'brass': 'horns',
+    'horn section': 'horns',
+    'horns': 'horns',
+    // Woodwinds
+    'saxophone': 'saxophone',
+    'alto saxophone': 'saxophone',
+    'tenor saxophone': 'saxophone',
+    'baritone saxophone': 'saxophone',
+    'flute': 'flute',
+    'clarinet': 'woodwinds',
+    'oboe': 'woodwinds',
+    'bassoon': 'woodwinds',
+    'woodwinds': 'woodwinds',
+    // Other instruments
+    'harmonica': 'harmonica',
+    'accordion': 'keyboards',
+    'banjo': 'guitar',
+    'mandolin': 'guitar',
+    'ukulele': 'guitar',
+    'harp': 'strings',
+    'turntables': 'turntables',
+    'dj': 'turntables',
+    'scratching': 'turntables',
+    // Engineering - specific roles
+    'mix': 'mixing',
+    'mixing': 'mixing',
+    'mastering': 'mastering',
+    'recording': 'recording',
     'engineer': 'engineer',
-    'recording': 'engineer',
+    'audio engineer': 'engineer',
+    'sound engineer': 'engineer',
+    'programming': 'programming',
+    'drum programming': 'programming',
+    'synth programming': 'programming',
+    // Songwriting - specific roles
     'writer': 'songwriter',
-    'composer': 'songwriter',
-    'lyricist': 'songwriter',
+    'songwriter': 'songwriter',
+    'composer': 'composer',
+    'lyricist': 'lyricist',
+    'arranger': 'arranger',
+    'music by': 'composer',
+    'lyrics by': 'lyricist',
+    'arranged by': 'arranger',
+    // Remix
+    'remix': 'remixer',
+    'remixer': 'remixer',
+    'remixed by': 'remixer',
+    // Band membership
     'member of band': 'member_of',
     'is person': 'member_of',
   }
 
-  return typeMap[lowerType] || 'featured'
+  // Check for exact matches first
+  if (typeMap[lowerType]) {
+    return typeMap[lowerType]
+  }
+
+  // Partial matching for instruments (more specific first)
+  if (lowerType.includes('remix')) return 'remixer'
+  if (lowerType.includes('background vocal') || lowerType.includes('backing vocal')) return 'background_vocals'
+  if (lowerType.includes('vocal') || lowerType.includes('voice') || lowerType.includes('singer')) return 'vocals'
+  if (lowerType.includes('choir') || lowerType.includes('chorus')) return 'choir'
+  if (lowerType.includes('guitar') || lowerType.includes('banjo') || lowerType.includes('mandolin')) return 'guitar'
+  if (lowerType.includes('bass')) return 'bass'
+  if (lowerType.includes('drum')) return 'drums'
+  if (lowerType.includes('percuss')) return 'percussion'
+  if (lowerType.includes('synth')) return 'synthesizer'
+  if (lowerType.includes('piano') || lowerType.includes('rhodes') || lowerType.includes('wurlitzer')) return 'piano'
+  if (lowerType.includes('organ')) return 'organ'
+  if (lowerType.includes('keyboard')) return 'keyboards'
+  if (lowerType.includes('violin') || lowerType.includes('fiddle')) return 'violin'
+  if (lowerType.includes('cello')) return 'cello'
+  if (lowerType.includes('string') || lowerType.includes('orchestra')) return 'strings'
+  if (lowerType.includes('trumpet')) return 'trumpet'
+  if (lowerType.includes('sax')) return 'saxophone'
+  if (lowerType.includes('flute')) return 'flute'
+  if (lowerType.includes('horn') || lowerType.includes('brass') || lowerType.includes('trombone') || lowerType.includes('tuba')) return 'horns'
+  if (lowerType.includes('clarinet') || lowerType.includes('oboe') || lowerType.includes('bassoon') || lowerType.includes('woodwind')) return 'woodwinds'
+  if (lowerType.includes('harmonica')) return 'harmonica'
+  if (lowerType.includes('turntable') || lowerType.includes('dj') || lowerType.includes('scratch')) return 'turntables'
+  if (lowerType.includes('programm')) return 'programming'
+  if (lowerType.includes('master')) return 'mastering'
+  if (lowerType.includes('mix')) return 'mixing'
+  if (lowerType.includes('record')) return 'recording'
+  if (lowerType.includes('engineer')) return 'engineer'
+  if (lowerType.includes('arrang')) return 'arranger'
+  if (lowerType.includes('lyric')) return 'lyricist'
+  if (lowerType.includes('compos')) return 'composer'
+
+  // Default: log unknown and return other_instrument for actual instruments, featured for performers
+  console.log(`[MusicBrainz] Unknown relation type: ${mbType}`)
+  return 'other_instrument'
 }
 
 export async function searchAndBuildGraph(query: string): Promise<MusicGraph> {

@@ -39,20 +39,56 @@ let driftEnabled = true
 let colorCycleInterval: number | null = null
 
 const roleColors: Record<RoleType, string> = {
+  // Artist roles - reds/corals
   primary_artist: '#ff6b6b',
   featured: '#4ecdc4',
+  remixer: '#e056fd',
+  // Production - yellows/golds
   producer: '#ffe66d',
   executive_producer: '#ffd93d',
   co_producer: '#ffec8b',
   vocal_producer: '#fff4a3',
   additional_producer: '#fff9c4',
+  // Songwriting - greens
   songwriter: '#95e1d3',
+  composer: '#7bed9f',
+  lyricist: '#a3de83',
+  arranger: '#b8e994',
+  // Engineering - blues
   engineer: '#a8d8ea',
+  mixing: '#74b9ff',
+  mastering: '#81ecec',
+  recording: '#a29bfe',
+  programming: '#6c5ce7',
+  // Vocals - pinks/reds
   vocals: '#f38181',
+  background_vocals: '#fab1a0',
+  choir: '#fd79a8',
+  // Strings - purples
   guitar: '#aa96da',
   bass: '#fcbad3',
-  drums: '#a8d8ea',
+  violin: '#c39bd3',
+  cello: '#bb8fce',
+  strings: '#d7bde2',
+  // Rhythm - teals
+  drums: '#48dbfb',
+  percussion: '#00d2d3',
+  // Keys - warm tones
   keyboards: '#d4a5a5',
+  piano: '#dfe6e9',
+  organ: '#b2bec3',
+  synthesizer: '#00cec9',
+  // Brass & Woodwinds - oranges/bronzes
+  saxophone: '#f39c12',
+  trumpet: '#e17055',
+  horns: '#d35400',
+  flute: '#fdcb6e',
+  woodwinds: '#f8b739',
+  // Other
+  harmonica: '#78e08f',
+  turntables: '#e056fd',
+  other_instrument: '#636e72',
+  // Relationships
   member_of: '#9b59b6',
   signed_to: '#3498db',
   released_on: '#e74c3c',
@@ -60,20 +96,56 @@ const roleColors: Record<RoleType, string> = {
 }
 
 const roleLabels: Record<RoleType, string> = {
+  // Artist roles
   primary_artist: 'Primary Artist',
   featured: 'Featured',
+  remixer: 'Remixer',
+  // Production
   producer: 'Producer',
   executive_producer: 'Executive Producer',
   co_producer: 'Co-Producer',
   vocal_producer: 'Vocal Producer',
   additional_producer: 'Additional Producer',
+  // Songwriting
   songwriter: 'Songwriter',
+  composer: 'Composer',
+  lyricist: 'Lyricist',
+  arranger: 'Arranger',
+  // Engineering
   engineer: 'Engineer',
+  mixing: 'Mixing',
+  mastering: 'Mastering',
+  recording: 'Recording',
+  programming: 'Programming',
+  // Vocals
   vocals: 'Vocals',
+  background_vocals: 'Background Vocals',
+  choir: 'Choir',
+  // Strings
   guitar: 'Guitar',
   bass: 'Bass',
+  violin: 'Violin',
+  cello: 'Cello',
+  strings: 'Strings',
+  // Rhythm
   drums: 'Drums',
+  percussion: 'Percussion',
+  // Keys
   keyboards: 'Keyboards',
+  piano: 'Piano',
+  organ: 'Organ',
+  synthesizer: 'Synthesizer',
+  // Brass & Woodwinds
+  saxophone: 'Saxophone',
+  trumpet: 'Trumpet',
+  horns: 'Horns',
+  flute: 'Flute',
+  woodwinds: 'Woodwinds',
+  // Other
+  harmonica: 'Harmonica',
+  turntables: 'Turntables',
+  other_instrument: 'Other',
+  // Relationships
   member_of: 'Member of',
   signed_to: 'Signed to',
   released_on: 'Released on',
@@ -82,24 +154,60 @@ const roleLabels: Record<RoleType, string> = {
 
 // Role weights for contribution scoring (higher = more important)
 const roleWeights: Record<RoleType, number> = {
-  primary_artist: 100,   // Main artist - highest weight
-  featured: 60,          // Featured artist - significant contribution
-  producer: 50,          // Producer - major creative role
-  executive_producer: 48, // Executive producer - oversight role
-  co_producer: 45,       // Co-producer - shared production
-  vocal_producer: 40,    // Vocal producer - specialized role
-  additional_producer: 35, // Additional producer - supplementary
-  songwriter: 45,        // Songwriter - core creative contribution
-  vocals: 35,            // Vocals - performance contribution
-  engineer: 25,          // Engineer - technical contribution
-  guitar: 20,            // Instrumentalist roles
+  // Artist roles
+  primary_artist: 100,
+  featured: 60,
+  remixer: 55,
+  // Production
+  producer: 50,
+  executive_producer: 48,
+  co_producer: 45,
+  vocal_producer: 40,
+  additional_producer: 35,
+  // Songwriting
+  songwriter: 45,
+  composer: 45,
+  lyricist: 40,
+  arranger: 35,
+  // Engineering
+  engineer: 25,
+  mixing: 25,
+  mastering: 20,
+  recording: 20,
+  programming: 30,
+  // Vocals
+  vocals: 35,
+  background_vocals: 25,
+  choir: 20,
+  // Strings
+  guitar: 20,
   bass: 20,
+  violin: 20,
+  cello: 20,
+  strings: 20,
+  // Rhythm
   drums: 20,
+  percussion: 15,
+  // Keys
   keyboards: 20,
-  member_of: 10,         // Relationship roles - lower weight
+  piano: 20,
+  organ: 15,
+  synthesizer: 20,
+  // Brass & Woodwinds
+  saxophone: 20,
+  trumpet: 20,
+  horns: 20,
+  flute: 15,
+  woodwinds: 15,
+  // Other
+  harmonica: 15,
+  turntables: 25,
+  other_instrument: 10,
+  // Relationships
+  member_of: 10,
   signed_to: 5,
   released_on: 5,
-  contains: 0,           // Structural relationship - no weight
+  contains: 0,
 }
 
 const entityColors: Record<string, string> = {
