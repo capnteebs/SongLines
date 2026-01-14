@@ -1,4 +1,4 @@
-# MusicGraph
+# SongLines
 
 A graph-based music metadata visualization tool that lets you explore relationships between artists, tracks, albums, and labels.
 
@@ -348,7 +348,7 @@ npm run type-check
 ```
 src/
 ├── components/
-│   ├── MusicGraph.vue    # Main graph visualization
+│   ├── SongLines.vue    # Main graph visualization
 │   ├── EntityPanel.vue   # Right sidebar details
 │   ├── NowPlaying.vue    # Bottom music player bar
 │   └── StatsPanel.vue    # Statistics dashboard
@@ -382,7 +382,7 @@ The following settings are persisted in localStorage:
 ### Main Interface (Dark Theme)
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  ◉ MusicGraph                    [🔍] [📊] [⇄] [☀] [⛶]         │
+│  ◉ SongLines                    [🔍] [📊] [⇄] [☀] [⛶]         │
 ├─────────────────────────────────────────────────────────────────┤
 │  ← JAY-Z → Rihanna → Run This Town                              │
 ├───────────────────────────────────────────┬─────────────────────┤
@@ -440,7 +440,7 @@ Connect your streaming account to:
 - Find the "bridges" between different genres you enjoy
 
 ### 📊 Data Visualization
-Use MusicGraph for presentations or articles:
+Use SongLines for presentations or articles:
 - Export high-resolution PNG images
 - Create custom graphs via JSON import
 - Embed in blog posts or research papers
@@ -508,8 +508,8 @@ CMD ["nginx", "-g", "daemon off;"]
 ```
 
 ```bash
-docker build -t musicgraph .
-docker run -p 8080:80 musicgraph
+docker build -t SongLines .
+docker run -p 8080:80 SongLines
 ```
 
 ### Static Hosting
@@ -558,7 +558,7 @@ Edit `src/style.css` to change the color scheme:
 ```
 
 #### Node Colors
-Edit `src/components/MusicGraph.vue`:
+Edit `src/components/SongLines.vue`:
 ```typescript
 const entityColors: Record<string, string> = {
   artist: '#ff6b9d',  // Pink
@@ -569,7 +569,7 @@ const entityColors: Record<string, string> = {
 ```
 
 #### Default Layout
-Change the initial layout in `MusicGraph.vue`:
+Change the initial layout in `SongLines.vue`:
 ```typescript
 const currentLayout = ref<'force' | 'hierarchical' | 'circle'>('force')
 ```
@@ -641,7 +641,7 @@ Replace `src/data/sampleData.ts` with your own data to change the default graph.
 2. Not in private/incognito mode
 3. Clear localStorage and try again:
    ```javascript
-   localStorage.removeItem('musicgraph-prefs')
+   localStorage.removeItem('SongLines-prefs')
    ```
 
 ### Import failing
@@ -668,7 +668,7 @@ A: That's the "drift" animation for a more organic feel. Click the ⏸ button in
 A: Yes, build the app and host it, then use an iframe. Or import the Vue components directly into your Vue project.
 
 **Q: How do I add custom relationship types?**
-A: Edit `src/types/music.ts` to add new role types, then update the color mappings in `MusicGraph.vue` and `EntityPanel.vue`.
+A: Edit `src/types/music.ts` to add new role types, then update the color mappings in `SongLines.vue` and `EntityPanel.vue`.
 
 **Q: Does this work offline?**
 A: Yes, the core app works offline. API integrations require internet, but imported JSON data works offline.
