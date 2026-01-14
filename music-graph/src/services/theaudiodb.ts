@@ -33,34 +33,59 @@ class RateLimiter {
 const rateLimiter = new RateLimiter()
 
 /**
+ * Simple in-memory cache for converted images
+ * Avoids re-fetching and re-converting the same images
+ */
+const imageCache = new Map<string, string>()
+
+/**
  * Convert image URL to base64 data URL to bypass CORS for canvas rendering
- * Uses a CORS proxy since TheAudioDB's CDN doesn't send CORS headers
+ * Uses multiple CORS proxies for reliability since TheAudioDB's CDN doesn't send CORS headers
  */
 async function toDataURL(url: string): Promise<string | undefined> {
+  // Check cache first
+  if (imageCache.has(url)) {
+    return imageCache.get(url)
+  }
+
   // List of CORS proxies to try (in order of preference)
+  // More proxies = better reliability
   const corsProxies = [
     (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
     (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    (u: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    (u: string) => `https://proxy.cors.sh/${u}`,
   ]
 
   for (const proxyFn of corsProxies) {
     try {
       const proxiedUrl = proxyFn(url)
-      const response = await fetch(proxiedUrl)
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 8000) // 8s timeout per proxy
+
+      const response = await fetch(proxiedUrl, { signal: controller.signal })
+      clearTimeout(timeoutId)
+
       if (!response.ok) continue
 
       const blob = await response.blob()
       // Verify it's actually an image
       if (!blob.type.startsWith('image/')) continue
 
-      return new Promise((resolve) => {
+      const dataUrl = await new Promise<string | undefined>((resolve) => {
         const reader = new FileReader()
         reader.onloadend = () => resolve(reader.result as string)
         reader.onerror = () => resolve(undefined)
         reader.readAsDataURL(blob)
       })
+
+      if (dataUrl) {
+        // Cache successful conversion
+        imageCache.set(url, dataUrl)
+        return dataUrl
+      }
     } catch (e) {
-      // Try next proxy
+      // Try next proxy (timeout or network error)
       continue
     }
   }
@@ -151,8 +176,9 @@ export async function getArtistImage(artistName: string): Promise<string | undef
       console.log(`[TheAudioDB] Image converted for ${artistName}`)
       return dataUrl
     }
-    // Fallback to original URL (works in <img> but not canvas)
-    return imageUrl
+    // Don't fall back to raw URL - it won't work in canvas anyway
+    console.log(`[TheAudioDB] CORS conversion failed for ${artistName}`)
+    return undefined
   }
 
   console.log(`[TheAudioDB] No image available for ${artistName}`)
@@ -212,8 +238,8 @@ export async function getArtistImageWithMBID(
           console.log(`[TheAudioDB] Image converted for ${artistName}`)
           return dataUrl
         }
-        // Fallback to original URL
-        return imageUrl
+        // Don't fall back to raw URL - it won't work in canvas anyway
+        console.log(`[TheAudioDB] CORS conversion failed for ${artistName} (MBID lookup)`)
       }
     }
   }

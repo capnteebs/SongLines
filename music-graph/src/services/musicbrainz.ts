@@ -6,30 +6,137 @@ import {
   clearCache as clearTrackCache,
   getCacheStats
 } from './trackCache'
-import { getAlbumImage, getArtistImage as getLastFmArtistImage } from './lastfm'
-import { getTrackCredits as getDiscogsCredits, isConfigured as isDiscogsConfigured } from './discogs'
+import { getAlbumImage as getLastFmAlbumImage, getArtistImage as getLastFmArtistImage } from './lastfm'
+import {
+  getTrackCredits as getDiscogsCredits,
+  isConfigured as isDiscogsConfigured,
+  getArtistImage as getDiscogsArtistImage
+} from './discogs'
 import { getArtistImageWithMBID as getAudioDBArtistImage } from './theaudiodb'
 
 /**
- * Get artist image with fallback chain: TheAudioDB -> Last.fm
- * TheAudioDB has artist images (via CORS proxy), Last.fm deprecated them
+ * Global image cache - stores images by normalized name
+ * This avoids redundant API calls when the same artist/album appears multiple times
+ *
+ * Values:
+ * - string: cached base64 data URL
+ * - null: we tried but no image was found (avoid re-fetching)
+ * - undefined (not in map): never tried
+ */
+const artistImageCache = new Map<string, string | null>()
+const albumImageCache = new Map<string, string | null>()
+
+/**
+ * Normalize name for cache key (lowercase, remove punctuation)
+ */
+function normalizeForCache(name: string): string {
+  return name.toLowerCase().replace(/[^\w\s]/g, '').trim()
+}
+
+/**
+ * Get artist image with caching and fallback chain: TheAudioDB -> Discogs -> Last.fm
+ *
+ * The cache is checked first to avoid redundant API calls.
+ * Images are stored as base64 data URLs for canvas/Cytoscape compatibility.
  */
 async function getArtistImage(artistName: string, mbid?: string): Promise<string | undefined> {
+  const cacheKey = normalizeForCache(artistName)
+
+  // Check cache first
+  if (artistImageCache.has(cacheKey)) {
+    const cached = artistImageCache.get(cacheKey)
+    if (cached) {
+      console.log(`[Image] Cache hit for artist: ${artistName}`)
+      return cached
+    }
+    // cached === null means we tried before and found nothing
+    console.log(`[Image] Cache hit (no image) for artist: ${artistName}`)
+    return undefined
+  }
+
+  console.log(`[Image] Cache miss for artist: ${artistName}, fetching...`)
+
   // Try TheAudioDB first (has artist images, uses CORS proxy for canvas compatibility)
   const audioDbImage = await getAudioDBArtistImage(artistName, mbid)
   if (audioDbImage) {
     console.log(`[Image] Found TheAudioDB image for ${artistName}`)
+    artistImageCache.set(cacheKey, audioDbImage)
     return audioDbImage
+  }
+
+  // Try Discogs (has good artist images)
+  if (isDiscogsConfigured()) {
+    const discogsImage = await getDiscogsArtistImage(artistName)
+    if (discogsImage) {
+      console.log(`[Image] Found Discogs image for ${artistName}`)
+      artistImageCache.set(cacheKey, discogsImage)
+      return discogsImage
+    }
   }
 
   // Fallback to Last.fm (deprecated but might still work for some artists)
   const lastFmImage = await getLastFmArtistImage(artistName)
   if (lastFmImage) {
     console.log(`[Image] Found Last.fm image for ${artistName}`)
+    artistImageCache.set(cacheKey, lastFmImage)
     return lastFmImage
   }
 
+  // Mark as "no image found" to avoid re-fetching
+  artistImageCache.set(cacheKey, null)
+  console.log(`[Image] No image found for ${artistName}, cached as null`)
   return undefined
+}
+
+/**
+ * Get album image with caching
+ * Uses Last.fm which still has good album artwork
+ */
+async function getAlbumImage(artistName: string, albumName: string): Promise<string | undefined> {
+  const cacheKey = `${normalizeForCache(artistName)}::${normalizeForCache(albumName)}`
+
+  // Check cache first
+  if (albumImageCache.has(cacheKey)) {
+    const cached = albumImageCache.get(cacheKey)
+    if (cached) {
+      console.log(`[Image] Cache hit for album: ${albumName}`)
+      return cached
+    }
+    console.log(`[Image] Cache hit (no image) for album: ${albumName}`)
+    return undefined
+  }
+
+  console.log(`[Image] Cache miss for album: ${albumName}, fetching...`)
+
+  const image = await getLastFmAlbumImage(artistName, albumName)
+  if (image) {
+    albumImageCache.set(cacheKey, image)
+    return image
+  }
+
+  // Mark as "no image found"
+  albumImageCache.set(cacheKey, null)
+  return undefined
+}
+
+/**
+ * Clear the image cache (useful for debugging or forced refresh)
+ */
+export function clearImageCache(): void {
+  artistImageCache.clear()
+  albumImageCache.clear()
+  console.log('[Image] Cache cleared')
+}
+
+/**
+ * Get image cache statistics
+ */
+export function getImageCacheStats(): { artists: number; albums: number; hits: number } {
+  return {
+    artists: artistImageCache.size,
+    albums: albumImageCache.size,
+    hits: [...artistImageCache.values(), ...albumImageCache.values()].filter(v => v !== null).length
+  }
 }
 
 // Re-export cache utilities for external use
@@ -40,6 +147,93 @@ const USER_AGENT = 'MusicGraph/1.0 (https://github.com/yourusername/music-graph)
 
 // Clean up expired cache entries on module load
 cleanupExpiredEntries()
+
+/**
+ * Artist Alias Resolution System
+ *
+ * Many artists have multiple names:
+ * - Stage name vs legal name: "The Weeknd" vs "Abel Tesfaye"
+ * - Variations: "Jay-Z" vs "JAY-Z" vs "Shawn Carter"
+ *
+ * This system maps all known aliases to a canonical artist MBID,
+ * enabling proper deduplication across different credit types.
+ */
+
+// Maps normalized alias name -> canonical MBID
+const aliasToMbidMap = new Map<string, string>()
+// Maps MBID -> canonical display name (for consistent naming)
+const mbidToCanonicalName = new Map<string, string>()
+// Set of MBIDs we've already fetched aliases for
+const fetchedAliases = new Set<string>()
+
+/**
+ * Fetch and cache all aliases for an artist from MusicBrainz
+ */
+async function fetchArtistAliases(mbid: string, primaryName: string): Promise<void> {
+  if (fetchedAliases.has(mbid)) {
+    return // Already fetched
+  }
+
+  fetchedAliases.add(mbid)
+
+  // Store the primary name mapping
+  const normalizedPrimary = normalizeForCache(primaryName)
+  aliasToMbidMap.set(normalizedPrimary, mbid)
+  mbidToCanonicalName.set(mbid, primaryName)
+
+  try {
+    // Fetch artist with aliases
+    const data = await fetchMB<{
+      id: string
+      name: string
+      aliases?: Array<{
+        name: string
+        'sort-name': string
+        type?: string
+        locale?: string
+      }>
+    }>(`/artist/${mbid}`, { inc: 'aliases' })
+
+    if (data.aliases && data.aliases.length > 0) {
+      console.log(`[Alias] Found ${data.aliases.length} aliases for "${primaryName}":`)
+      for (const alias of data.aliases) {
+        const normalizedAlias = normalizeForCache(alias.name)
+        if (!aliasToMbidMap.has(normalizedAlias)) {
+          aliasToMbidMap.set(normalizedAlias, mbid)
+          console.log(`  - "${alias.name}" → ${mbid}`)
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`[Alias] Failed to fetch aliases for ${primaryName}:`, e)
+  }
+}
+
+/**
+ * Resolve an artist name to a canonical MBID (if known)
+ * Returns undefined if the name isn't a known alias
+ */
+function resolveArtistAlias(name: string): string | undefined {
+  const normalized = normalizeForCache(name)
+  return aliasToMbidMap.get(normalized)
+}
+
+/**
+ * Get the canonical display name for an MBID
+ */
+function getCanonicalName(mbid: string): string | undefined {
+  return mbidToCanonicalName.get(mbid)
+}
+
+/**
+ * Clear alias cache (useful for debugging)
+ */
+export function clearAliasCache(): void {
+  aliasToMbidMap.clear()
+  mbidToCanonicalName.clear()
+  fetchedAliases.clear()
+  console.log('[Alias] Cache cleared')
+}
 
 // Rate limiter: MusicBrainz requires max 1 request per second
 class RateLimiter {
@@ -788,6 +982,14 @@ export async function buildGraphFromTrack(
     }
   }
 
+  // Fetch aliases for primary artists (needed for deduping songwriter credits like "Abel Tesfaye" → "The Weeknd")
+  // Do this before processing work relations
+  console.log('[MusicBrainz] Fetching aliases for primary artists...')
+  const aliasPromises = artistCredits.map(credit =>
+    fetchArtistAliases(credit.artist.id, credit.artist.name).catch(() => {})
+  )
+  await Promise.all(aliasPromises)
+
   // Add album from releases (pick best match using scoring)
   // Use full recording's releases (more complete than search results)
   // Also track if this track was released as a single (for artwork)
@@ -939,9 +1141,24 @@ export async function buildGraphFromTrack(
         const personnelId = `artist-${rel.artist.id}`
         const normalizedName = normalizeArtistName(rel.artist.name)
 
-        // Check if this artist already exists (by ID or normalized name)
+        // Check if this artist already exists by:
+        // 1. Same MBID (direct match)
+        // 2. Same normalized name (e.g., "J.I.D." vs "JID")
+        // 3. Alias resolution (e.g., "Abel Tesfaye" → "The Weeknd")
         let effectivePersonnelId = personnelId
-        if (normalizedArtistNames.has(normalizedName) && !entityIds.has(personnelId)) {
+
+        // First, check alias resolution
+        const canonicalMbid = resolveArtistAlias(rel.artist.name)
+        if (canonicalMbid && canonicalMbid !== rel.artist.id) {
+          const canonicalId = `artist-${canonicalMbid}`
+          if (entityIds.has(canonicalId)) {
+            effectivePersonnelId = canonicalId
+            const canonicalName = getCanonicalName(canonicalMbid)
+            console.log(`[MusicBrainz] Alias match: "${rel.artist.name}" → "${canonicalName}" (personnel)`)
+          }
+        }
+        // Then check normalized name
+        else if (normalizedArtistNames.has(normalizedName) && !entityIds.has(personnelId)) {
           const existingArtist = entities.find(e => normalizeArtistName(e.name) === normalizedName && e.type === 'artist')
           if (existingArtist) {
             effectivePersonnelId = existingArtist.id
@@ -1026,9 +1243,24 @@ export async function buildGraphFromTrack(
               const personnelId = `artist-${rel.artist.id}`
               const normalizedName = normalizeArtistName(rel.artist.name)
 
-              // Check if this artist already exists (by ID or normalized name)
+              // Check if this artist already exists by:
+              // 1. Same MBID (direct match)
+              // 2. Same normalized name (e.g., "J.I.D." vs "JID")
+              // 3. Alias resolution (e.g., "Abel Tesfaye" → "The Weeknd")
               let effectivePersonnelId = personnelId
-              if (normalizedArtistNames.has(normalizedName) && !entityIds.has(personnelId)) {
+
+              // First, check alias resolution - this handles "Abel Tesfaye" → "The Weeknd"
+              const canonicalMbid = resolveArtistAlias(rel.artist.name)
+              if (canonicalMbid && canonicalMbid !== rel.artist.id) {
+                const canonicalId = `artist-${canonicalMbid}`
+                if (entityIds.has(canonicalId)) {
+                  effectivePersonnelId = canonicalId
+                  const canonicalName = getCanonicalName(canonicalMbid)
+                  console.log(`[MusicBrainz] Alias match: "${rel.artist.name}" → "${canonicalName}" (work relation)`)
+                }
+              }
+              // Then check normalized name (for punctuation variations)
+              else if (normalizedArtistNames.has(normalizedName) && !entityIds.has(personnelId)) {
                 const existingArtist = entities.find(e => normalizeArtistName(e.name) === normalizedName && e.type === 'artist')
                 if (existingArtist) {
                   effectivePersonnelId = existingArtist.id
@@ -1101,29 +1333,58 @@ export async function buildGraphFromTrack(
       if (discogsCredits.entities.length > 0) {
         console.log(`[Discogs] Found ${discogsCredits.entities.length} additional credits`)
 
-        // Merge Discogs entities, avoiding duplicates by normalized name
+        // Merge Discogs entities, avoiding duplicates by:
+        // 1. Normalized name match
+        // 2. Alias resolution (e.g., "Abel Tesfaye" from Discogs → "The Weeknd" from MusicBrainz)
         const existingNames = new Set(entities.map(e => normalizeArtistName(e.name)))
         for (const entity of discogsCredits.entities) {
-          if (!existingNames.has(normalizeArtistName(entity.name))) {
+          const normalizedName = normalizeArtistName(entity.name)
+
+          // Check if this is an alias of an existing artist
+          const canonicalMbid = resolveArtistAlias(entity.name)
+          if (canonicalMbid) {
+            const canonicalId = `artist-${canonicalMbid}`
+            if (entityIds.has(canonicalId)) {
+              const canonicalName = getCanonicalName(canonicalMbid)
+              console.log(`[Discogs] Alias match: "${entity.name}" → "${canonicalName}" (skipping duplicate)`)
+              continue // Skip - already have this artist
+            }
+          }
+
+          // Check normalized name match
+          if (!existingNames.has(normalizedName)) {
             entities.push(entity)
-            existingNames.add(normalizeArtistName(entity.name))
+            existingNames.add(normalizedName)
             entityIds.add(entity.id)
           }
         }
 
-        // Merge relationships, mapping Discogs artist IDs to existing entities where possible
+        // Merge relationships, mapping Discogs artist IDs to existing entities
         for (const rel of discogsCredits.relationships) {
-          // Try to find existing entity with same name (using normalized comparison)
           const discogsEntity = discogsCredits.entities.find(e => e.id === rel.target)
           if (discogsEntity) {
             const normalizedDiscogsName = normalizeArtistName(discogsEntity.name)
-            const existingEntity = entities.find(e =>
-              normalizeArtistName(e.name) === normalizedDiscogsName && e.type === 'artist'
-            )
-            if (existingEntity && existingEntity.id !== rel.target) {
-              // Remap to existing entity
-              rel.target = existingEntity.id
-              rel.id = `rel-${trackId}-${existingEntity.id}-${rel.role}-discogs`
+
+            // First, try alias resolution
+            const canonicalMbid = resolveArtistAlias(discogsEntity.name)
+            if (canonicalMbid) {
+              const canonicalId = `artist-${canonicalMbid}`
+              if (entityIds.has(canonicalId)) {
+                rel.target = canonicalId
+                rel.id = `rel-${trackId}-${canonicalId}-${rel.role}-discogs`
+                const canonicalName = getCanonicalName(canonicalMbid)
+                console.log(`[Discogs] Alias remap: "${discogsEntity.name}" → "${canonicalName}" (relationship)`)
+              }
+            }
+            // Then try normalized name match
+            else {
+              const existingEntity = entities.find(e =>
+                normalizeArtistName(e.name) === normalizedDiscogsName && e.type === 'artist'
+              )
+              if (existingEntity && existingEntity.id !== rel.target) {
+                rel.target = existingEntity.id
+                rel.id = `rel-${trackId}-${existingEntity.id}-${rel.role}-discogs`
+              }
             }
           }
 

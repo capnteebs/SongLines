@@ -22,6 +22,68 @@ const BASE_URL = 'https://api.discogs.com'
 const USER_AGENT = 'MusicGraph/1.0 +https://github.com/yourusername/music-graph'
 
 /**
+ * Simple in-memory cache for converted images
+ * Avoids re-fetching and re-converting the same images
+ */
+const imageCache = new Map<string, string>()
+
+/**
+ * Convert image URL to base64 data URL to bypass CORS for canvas rendering
+ * Uses multiple CORS proxies for reliability since Discogs CDN doesn't send CORS headers
+ */
+async function toDataURL(url: string): Promise<string | undefined> {
+  // Check cache first
+  if (imageCache.has(url)) {
+    return imageCache.get(url)
+  }
+
+  // List of CORS proxies to try (in order of preference)
+  // More proxies = better reliability
+  const corsProxies = [
+    (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    (u: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    (u: string) => `https://proxy.cors.sh/${u}`,
+  ]
+
+  for (const proxyFn of corsProxies) {
+    try {
+      const proxiedUrl = proxyFn(url)
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 8000) // 8s timeout per proxy
+
+      const response = await fetch(proxiedUrl, { signal: controller.signal })
+      clearTimeout(timeoutId)
+
+      if (!response.ok) continue
+
+      const blob = await response.blob()
+      // Verify it's actually an image
+      if (!blob.type.startsWith('image/')) continue
+
+      const dataUrl = await new Promise<string | undefined>((resolve) => {
+        const reader = new FileReader()
+        reader.onloadend = () => resolve(reader.result as string)
+        reader.onerror = () => resolve(undefined)
+        reader.readAsDataURL(blob)
+      })
+
+      if (dataUrl) {
+        // Cache successful conversion
+        imageCache.set(url, dataUrl)
+        return dataUrl
+      }
+    } catch (e) {
+      // Try next proxy (timeout or network error)
+      continue
+    }
+  }
+
+  console.warn('[Discogs] All CORS proxies failed for:', url)
+  return undefined
+}
+
+/**
  * Check if Discogs API is configured
  */
 export function isConfigured(): boolean {
@@ -86,6 +148,19 @@ interface DiscogsSearchResult {
   cover_image?: string
 }
 
+interface DiscogsArtistDetails {
+  id: number
+  name: string
+  images?: Array<{
+    type: string
+    uri: string
+    uri150: string
+    width: number
+    height: number
+  }>
+  profile?: string
+}
+
 interface DiscogsSearchResponse {
   pagination: {
     page: number
@@ -124,6 +199,95 @@ async function fetchDiscogs<T>(endpoint: string, params: Record<string, string> 
   }
 
   return response.json()
+}
+
+/**
+ * Search for an artist by name
+ */
+export async function searchArtist(artistName: string): Promise<DiscogsSearchResult[]> {
+  if (!isConfigured()) {
+    return []
+  }
+
+  try {
+    const data = await fetchDiscogs<DiscogsSearchResponse>('/database/search', {
+      q: artistName,
+      type: 'artist',
+      per_page: '5',
+    })
+    return data.results || []
+  } catch (e) {
+    console.error('[Discogs] Artist search failed:', e)
+    return []
+  }
+}
+
+/**
+ * Get artist details including images
+ */
+export async function getArtistDetails(artistId: number): Promise<DiscogsArtistDetails | null> {
+  try {
+    return await fetchDiscogs<DiscogsArtistDetails>(`/artists/${artistId}`)
+  } catch (e) {
+    console.error('[Discogs] Failed to get artist:', e)
+    return null
+  }
+}
+
+/**
+ * Get artist image from Discogs
+ * Returns a base64 data URL for canvas/Cytoscape compatibility
+ */
+export async function getArtistImage(artistName: string): Promise<string | undefined> {
+  if (!isConfigured()) {
+    return undefined
+  }
+
+  try {
+    const results = await searchArtist(artistName)
+    if (results.length === 0) {
+      return undefined
+    }
+
+    // Find best match by name
+    const normalizedSearch = artistName.toLowerCase().replace(/[^\w\s]/g, '').trim()
+    const bestMatch = results.find(r => {
+      const normalizedResult = r.title.toLowerCase().replace(/[^\w\s]/g, '').trim()
+      return normalizedResult === normalizedSearch || normalizedResult.includes(normalizedSearch)
+    }) || results[0]
+
+    if (!bestMatch) {
+      return undefined
+    }
+
+    // Get full artist details with images
+    const artist = await getArtistDetails(bestMatch.id)
+    if (!artist?.images?.length) {
+      return undefined
+    }
+
+    // Prefer primary image, fall back to first image
+    const primaryImage = artist.images.find(img => img.type === 'primary')
+    const image = primaryImage || artist.images[0]
+
+    if (image?.uri) {
+      console.log(`[Discogs] Found artist image for ${artistName}, converting to data URL...`)
+      // Convert to data URL to bypass CORS for canvas rendering
+      const dataUrl = await toDataURL(image.uri)
+      if (dataUrl) {
+        console.log(`[Discogs] Image converted for ${artistName}`)
+        return dataUrl
+      }
+      // Don't fall back to raw URL - it won't work in canvas anyway
+      console.log(`[Discogs] CORS conversion failed for ${artistName}`)
+      return undefined
+    }
+
+    return undefined
+  } catch (e) {
+    console.error('[Discogs] Failed to get artist image:', e)
+    return undefined
+  }
 }
 
 /**
@@ -335,11 +499,27 @@ export async function getTrackCredits(
   const trackId = existingTrackId || `track-discogs-${release.id}`
   const normalizedTrackName = normalizeForComparison(trackName)
 
+  // Log the tracklist for debugging
+  console.log(`[Discogs] Release "${release.title}" has ${release.tracklist.length} tracks:`)
+  release.tracklist.slice(0, 10).forEach((t, i) => {
+    const hasCredits = t.extraartists ? ` (${t.extraartists.length} credits)` : ''
+    console.log(`  ${i + 1}. "${t.title}"${hasCredits}`)
+  })
+  if (release.tracklist.length > 10) {
+    console.log(`  ... and ${release.tracklist.length - 10} more`)
+  }
+
   // Find the specific track in the tracklist
   const matchingTrack = release.tracklist.find(t =>
     normalizeForComparison(t.title).includes(normalizedTrackName) ||
     normalizedTrackName.includes(normalizeForComparison(t.title))
   )
+
+  if (matchingTrack) {
+    console.log(`[Discogs] Matched track: "${matchingTrack.title}" (position: ${matchingTrack.position})`)
+  } else {
+    console.log(`[Discogs] No track match found for "${trackName}" (normalized: "${normalizedTrackName}")`)
+  }
 
   // Process track-level credits if we found the track
   if (matchingTrack?.extraartists) {
@@ -372,8 +552,12 @@ export async function getTrackCredits(
   }
 
   // Also process release-level credits (often has producers, engineers)
-  if (release.extraartists) {
-    console.log(`[Discogs] Processing ${release.extraartists.length} release-level credits`)
+  if (release.extraartists && release.extraartists.length > 0) {
+    console.log(`[Discogs] Processing ${release.extraartists.length} release-level credits:`)
+    release.extraartists.slice(0, 10).forEach((a, i) => {
+      const trackInfo = a.tracks ? ` [tracks: ${a.tracks}]` : ' [all tracks]'
+      console.log(`  ${i + 1}. ${a.name}: ${a.role}${trackInfo}`)
+    })
 
     for (const artist of release.extraartists) {
       const artistId = `artist-discogs-${artist.id}`
@@ -407,6 +591,8 @@ export async function getTrackCredits(
         role,
       })
     }
+  } else {
+    console.log('[Discogs] No release-level credits found (extraartists is empty or missing)')
   }
 
   console.log(`[Discogs] Found ${entities.length} credits`)

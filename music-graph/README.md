@@ -770,6 +770,43 @@ Deduplication checks both MusicBrainz ID and normalized name.
 
 ---
 
+### Artist Alias Resolution (e.g., "Abel Tesfaye" → "The Weeknd")
+
+**Problem**: Same artist credited under different names - stage name vs legal name, or different variations.
+
+Examples:
+- "The Weeknd" (performer) vs "Abel Tesfaye" (songwriter)
+- "Jay-Z" vs "Shawn Carter"
+- "Pharrell Williams" vs "Pharrell"
+
+**Cause**: MusicBrainz credits the legal name for songwriting/composing roles while using the stage name for performing credits.
+
+**Solution**: Implemented an alias resolution system:
+
+1. **Fetch aliases**: When a primary artist is added, fetch their aliases from MusicBrainz
+2. **Build alias map**: Map all known aliases (normalized) → canonical MBID
+3. **Resolve on add**: When adding personnel/songwriter credits, check if the name is an alias of an existing artist
+4. **Cross-source dedup**: Also works for Discogs credits that match MusicBrainz artists
+
+```typescript
+// Console output when alias is resolved:
+[Alias] Found 5 aliases for "The Weeknd":
+  - "Abel Tesfaye" → c8b03190-306c-4f38-9235-9e5a0e0c3113
+  - "Abel Makkonen Tesfaye" → c8b03190-306c-4f38-9235-9e5a0e0c3113
+...
+[MusicBrainz] Alias match: "Abel Tesfaye" → "The Weeknd" (work relation)
+```
+
+**Cache Utilities:**
+```typescript
+import { clearAliasCache } from './services/musicbrainz'
+
+// Clear alias cache (for debugging)
+clearAliasCache()
+```
+
+---
+
 ### Same Artist Listed Multiple Times (Calvin Harris - Rollin)
 
 **Problem**: Calvin Harris appeared 8 times under "Featured".
@@ -839,6 +876,74 @@ Added 45+ role types covering:
 - **Engineering**: engineer, mixing, mastering, recording, programming
 - **Vocals**: vocals, background_vocals, choir
 - **Instruments**: guitar, bass, drums, percussion, keyboards, piano, organ, synthesizer, violin, cello, strings, saxophone, trumpet, horns, flute, woodwinds, harmonica, turntables
+
+---
+
+### Artist Image Fallback Chain & Caching
+
+**Problem**: Some artists don't have images in TheAudioDB, leaving nodes without pictures. Additionally, the same artist appearing multiple times caused redundant API calls.
+
+**Solution**: Implemented a multi-source fallback chain with multi-level caching:
+
+**Fallback Chain:**
+1. **TheAudioDB** (primary) - Uses CORS proxy for canvas compatibility
+2. **Discogs** (backup) - Has good coverage for lesser-known artists
+3. **Last.fm** (fallback) - Deprecated but sometimes still works
+
+**Caching Layers:**
+
+1. **High-level cache** (`musicbrainz.ts`) - Caches by normalized artist/album name
+   - Avoids redundant API calls when same artist appears multiple times
+   - Stores `null` for "not found" to avoid re-fetching failures
+   - Shared between properties panel and Cytoscape nodes
+
+2. **CORS proxy cache** (`theaudiodb.ts`, `discogs.ts`) - Caches converted data URLs
+   - Stores base64 data URLs after successful CORS proxy conversion
+   - Avoids re-converting the same image URL
+
+**CORS Proxy Strategy:**
+- Images from TheAudioDB and Discogs don't support CORS headers
+- Canvas-based rendering (Cytoscape) requires CORS-compatible images
+- Multiple CORS proxies tried in order: corsproxy.io, allorigins.win, codetabs.com, proxy.cors.sh
+- 8-second timeout per proxy to fail fast
+- If all proxies fail, returns `undefined` (no fallback to raw URLs that would break canvas)
+
+**Cache Utilities:**
+```typescript
+import { clearImageCache, getImageCacheStats } from './services/musicbrainz'
+
+// Clear all cached images (force refresh)
+clearImageCache()
+
+// Get cache statistics
+const stats = getImageCacheStats()
+// { artists: 15, albums: 3, hits: 12 }
+```
+
+---
+
+### Discogs Credits Debugging
+
+**Problem**: Some tracks show Discogs credits on the website but not in the app.
+
+**Cause**: Could be track name mismatch, wrong release selected, or credits at release-level vs track-level.
+
+**Solution**: Added comprehensive logging to debug Discogs credit fetching:
+- Logs full tracklist from matched release
+- Shows which tracks have credits attached
+- Reports track matching success/failure
+- Lists all release-level credits with track assignments
+
+Console output helps diagnose issues:
+```
+[Discogs] Release "Album" has 12 tracks:
+  1. "Track One"
+  2. "Here I Am" (3 credits)
+[Discogs] Matched track: "Here I Am" (position: 2)
+[Discogs] Processing 5 release-level credits:
+  1. Producer Name: Producer [all tracks]
+  2. Engineer Name: Mixed By [tracks: 1, 2]
+```
 
 ## Changelog
 
