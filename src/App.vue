@@ -580,7 +580,7 @@ watch(showPathFinder, (val) => {
       <div class="header-left">
         <div class="brand">
           <span class="logo">◉</span>
-          <h1>MusicGraph</h1>
+          <h1>SongLines</h1>
         </div>
       </div>
 
@@ -832,8 +832,10 @@ watch(showPathFinder, (val) => {
     <Transition name="modal">
       <div v-if="showLastFm" class="modal-overlay" @click.self="showLastFm = false">
         <LastFmPanel
+          :scrobble-username="lastfmUsername"
           @load-graph="handleLoadGraph"
           @close="showLastFm = false"
+          @update-scrobble-username="(u) => lastfmUsername = u"
         />
       </div>
     </Transition>

@@ -1,6 +1,6 @@
 # Technical Notes & Issues Solved
 
-This document tracks technical decisions, bugs fixed, and implementation details for the MusicGraph project.
+This document tracks technical decisions, bugs fixed, and implementation details for the SongLines project.
 
 ## Table of Contents
 
@@ -273,4 +273,4 @@ Added 45+ role types covering:
 | **Brass & Woodwinds** | saxophone, trumpet, horns, flute, woodwinds |
 | **Other** | harmonica, turntables, other_instrument |
 
-**Code**: `RoleType` in `src/types/music.ts`, `roleColors` in `src/components/MusicGraph.vue`
+**Code**: `RoleType` in `src/types/music.ts`, `roleColors` in `src/components/SongLines.vue`

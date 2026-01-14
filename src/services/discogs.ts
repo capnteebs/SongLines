@@ -19,7 +19,7 @@ import type { MusicEntity, Relationship, RoleType } from '../types/music'
 // Configuration
 const DISCOGS_TOKEN = import.meta.env.VITE_DISCOGS_TOKEN || ''
 const BASE_URL = 'https://api.discogs.com'
-const USER_AGENT = 'MusicGraph/1.0 +https://github.com/yourusername/music-graph'
+const USER_AGENT = 'SongLines/1.0 +https://github.com/yourusername/songlines'
 
 /**
  * Simple in-memory cache for converted images

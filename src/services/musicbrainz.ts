@@ -143,7 +143,7 @@ export function getImageCacheStats(): { artists: number; albums: number; hits: n
 export { clearTrackCache, getCacheStats }
 
 const BASE_URL = 'https://musicbrainz.org/ws/2'
-const USER_AGENT = 'MusicGraph/1.0 (https://github.com/yourusername/music-graph)'
+const USER_AGENT = 'SongLines/1.0 (https://github.com/yourusername/songlines)'
 
 // Clean up expired cache entries on module load
 cleanupExpiredEntries()

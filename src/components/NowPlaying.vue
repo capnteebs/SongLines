@@ -412,42 +412,6 @@ onUnmounted(() => {
         <span class="np-album-name">{{ currentTrack.album }}</span>
       </div>
 
-      <!-- Last.fm connection status -->
-      <div class="np-lastfm-connection">
-        <template v-if="isConnected && lastfmUsername">
-          <button class="np-lastfm-btn connected" @click="handleDisconnect" title="Disconnect Last.fm">
-            <span class="lastfm-dot"></span>
-            <span>{{ lastfmUsername }}</span>
-          </button>
-          <button
-            class="np-sync-btn"
-            :class="{ active: autoSyncGraph }"
-            @click="autoSyncGraph = !autoSyncGraph"
-            :title="autoSyncGraph ? 'Auto-sync enabled: Graph updates with playing track' : 'Auto-sync disabled'"
-          >
-            <span class="sync-icon">{{ autoSyncGraph ? '⟳' : '○' }}</span>
-          </button>
-        </template>
-        <template v-else-if="showUsernameInput">
-          <div class="np-username-input">
-            <input
-              v-model="usernameInput"
-              type="text"
-              placeholder="Last.fm username"
-              @keydown.enter="handleSetUsername"
-              @keydown.escape="showUsernameInput = false"
-            />
-            <button class="np-username-btn" @click="handleSetUsername">Connect</button>
-          </div>
-        </template>
-        <template v-else>
-          <button class="np-lastfm-btn" @click="showUsernameInput = true" title="Connect Last.fm">
-            <span class="lastfm-icon-btn">♪</span>
-            <span>Last.fm</span>
-          </button>
-        </template>
-      </div>
-
       <button
         v-if="!currentTrack?.isLastFm"
         class="np-view-btn"
@@ -724,6 +688,7 @@ onUnmounted(() => {
   align-items: flex-end;
   gap: 2px;
   min-width: 0;
+  text-align: right;
 }
 
 .np-album-label {
@@ -739,7 +704,8 @@ onUnmounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 140px;
+  max-width: 200px;
+  text-align: right;
 }
 
 .np-view-btn {

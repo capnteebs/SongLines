@@ -28,7 +28,7 @@ import type { MusicGraph, MusicEntity, Relationship } from '../types/music'
 // Configuration
 const config = {
   developerToken: 'YOUR_DEVELOPER_TOKEN', // JWT token from your server
-  appName: 'MusicGraph',
+  appName: 'SongLines',
   appBuild: '1.0.0',
 }
 

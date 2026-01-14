@@ -1,12 +1,17 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import * as lastfm from '../services/lastfm'
 import type { MusicGraph } from '../types/music'
 import type { GraphOptions } from '../services/lastfm'
 
+const props = defineProps<{
+  scrobbleUsername?: string
+}>()
+
 const emit = defineEmits<{
   (e: 'load-graph', graph: MusicGraph): void
   (e: 'close'): void
+  (e: 'update-scrobble-username', username: string): void
 }>()
 
 const isConfigured = lastfm.isConfigured()
@@ -18,6 +23,21 @@ const loadingStatus = ref('')
 const error = ref<string | null>(null)
 const searchResults = ref<Array<{ name: string; image?: string }>>([])
 const showOptions = ref(false)
+
+// Scrobble tracking state
+const scrobbleInput = ref(props.scrobbleUsername || '')
+const isScrobbleConnected = computed(() => !!props.scrobbleUsername)
+
+function connectScrobble() {
+  if (scrobbleInput.value.trim()) {
+    emit('update-scrobble-username', scrobbleInput.value.trim())
+  }
+}
+
+function disconnectScrobble() {
+  emit('update-scrobble-username', '')
+  scrobbleInput.value = ''
+}
 
 // Graph options
 const graphOptions = ref<GraphOptions>({
@@ -242,6 +262,41 @@ function handleUserKeydown(e: KeyboardEvent) {
       <div v-if="isLoading" class="loading">
         <div class="spinner"></div>
         <span>{{ loadingStatus || 'Loading from Last.fm...' }}</span>
+      </div>
+
+      <!-- Scrobble tracking section -->
+      <div class="scrobble-section">
+        <div class="scrobble-header">
+          <span class="scrobble-title">Now Playing Sync</span>
+          <span class="scrobble-subtitle">Auto-update graph with your current track</span>
+        </div>
+        <div class="scrobble-content">
+          <template v-if="isScrobbleConnected">
+            <div class="scrobble-connected">
+              <span class="scrobble-dot"></span>
+              <span class="scrobble-user">{{ props.scrobbleUsername }}</span>
+              <button class="scrobble-disconnect" @click="disconnectScrobble">Disconnect</button>
+            </div>
+          </template>
+          <template v-else>
+            <div class="scrobble-input-row">
+              <input
+                v-model="scrobbleInput"
+                type="text"
+                placeholder="Last.fm username"
+                class="scrobble-input"
+                @keydown.enter="connectScrobble"
+              />
+              <button
+                class="scrobble-connect-btn"
+                :disabled="!scrobbleInput.trim()"
+                @click="connectScrobble"
+              >
+                Connect
+              </button>
+            </div>
+          </template>
+        </div>
       </div>
     </template>
   </div>
@@ -593,5 +648,126 @@ function handleUserKeydown(e: KeyboardEvent) {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* Scrobble tracking section */
+.scrobble-section {
+  margin-top: 16px;
+  padding: 16px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.scrobble-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 12px;
+}
+
+.scrobble-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.scrobble-subtitle {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.scrobble-content {
+  display: flex;
+  align-items: center;
+}
+
+.scrobble-connected {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+}
+
+.scrobble-dot {
+  width: 8px;
+  height: 8px;
+  background: #4CAF50;
+  border-radius: 50%;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.scrobble-user {
+  flex: 1;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.8);
+  font-weight: 500;
+}
+
+.scrobble-disconnect {
+  padding: 6px 12px;
+  background: rgba(255, 82, 82, 0.15);
+  border: 1px solid rgba(255, 82, 82, 0.3);
+  border-radius: 6px;
+  color: #ff5252;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.scrobble-disconnect:hover {
+  background: rgba(255, 82, 82, 0.25);
+  border-color: rgba(255, 82, 82, 0.5);
+}
+
+.scrobble-input-row {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+}
+
+.scrobble-input {
+  flex: 1;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: #fff;
+  font-size: 13px;
+  outline: none;
+}
+
+.scrobble-input:focus {
+  border-color: rgba(76, 175, 80, 0.5);
+}
+
+.scrobble-input::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+.scrobble-connect-btn {
+  padding: 8px 14px;
+  background: rgba(76, 175, 80, 0.2);
+  border: 1px solid rgba(76, 175, 80, 0.4);
+  border-radius: 6px;
+  color: #4CAF50;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.scrobble-connect-btn:hover:not(:disabled) {
+  background: rgba(76, 175, 80, 0.3);
+  border-color: rgba(76, 175, 80, 0.6);
+}
+
+.scrobble-connect-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 </style>
