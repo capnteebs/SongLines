@@ -729,6 +729,117 @@ Use GitHub Issues with:
 - Browser and OS information
 - Screenshots if applicable
 
+## Technical Notes & Issues Solved
+
+This section documents technical decisions and bugs that were fixed during development.
+
+### Recording Lookup Strategy
+
+**Problem**: MusicBrainz has multiple recordings of the same track (studio, live, remixes). Searching for "Smooth Criminal" might return a live bootleg instead of the studio version with full production credits.
+
+**Solution**: When album name is provided, use release-based lookup:
+1. Search for the release (album) first
+2. Get the track list from that specific release
+3. Use the exact recording ID linked to that release
+
+This ensures we get the recording with production credits (e.g., Quincy Jones on "Smooth Criminal" from "Bad").
+
+---
+
+### Artist Images Not Showing on Graph Nodes
+
+**Problem**: Artist pictures appeared in the side panel but not on graph nodes.
+
+**Cause**: TheAudioDB's CDN blocks CORS requests, preventing Cytoscape.js (canvas-based) from rendering images. Last.fm deprecated artist images.
+
+**Solution**: Use CORS proxies (corsproxy.io, allorigins.win) to fetch TheAudioDB images and convert them to base64 data URLs. See `src/services/theaudiodb.ts`.
+
+---
+
+### Duplicate Artist Entries (e.g., "JID" vs "J.I.D.")
+
+**Problem**: Same artist appearing multiple times with slight name variations.
+
+**Cause**: MusicBrainz may credit the artist differently in different places, or Discogs adds them with different spelling.
+
+**Solution**: Added `normalizeArtistName()` function that strips punctuation for comparison:
+- "J.I.D." → "jid"
+- "A$AP Rocky" → "asap rocky"
+
+Deduplication checks both MusicBrainz ID and normalized name.
+
+---
+
+### Same Artist Listed Multiple Times (Calvin Harris - Rollin)
+
+**Problem**: Calvin Harris appeared 8 times under "Featured".
+
+**Cause**:
+1. Instrument relations were falling through to 'featured' default
+2. Relationship IDs used raw MusicBrainz type instead of mapped role
+
+**Solution**:
+1. Expanded role mappings for instruments
+2. Fixed deduplication to use mapped role in relationship IDs
+3. Added attribute checking for MusicBrainz "instrument" type
+
+---
+
+### Sparse Credits for Popular Tracks
+
+**Problem**: "Smooth Criminal" only showed primary artist and songwriter, missing Quincy Jones, Bruce Swedien, etc.
+
+**Cause**: MusicBrainz search returned wrong recording version (one without credits).
+
+**Solution**: Release-based recording lookup (see above).
+
+---
+
+### Duplicate Songwriter Entries
+
+**Problem**: Michael Jackson appearing twice as songwriter.
+
+**Cause**: Artist credited as both "composer" and "lyricist" on the work, but both mapped to "songwriter".
+
+**Solution**: Map composer/lyricist to separate roles. Use mapped role in relationship ID for deduplication.
+
+---
+
+### Track Image Should Use Single Artwork
+
+**Problem**: Track always used album artwork, even when released as a single with different cover.
+
+**Solution**: Check if recording has a Single release. If so, fetch that single's artwork. Fall back to album art if no single exists.
+
+---
+
+### Discogs Matching Anniversary Editions
+
+**Problem**: Discogs matched "Bad 25" instead of original "Bad" album.
+
+**Solution**: Added scoring penalties for anniversary editions (25, 30, 40, 50), deluxe, special, remaster editions.
+
+---
+
+### MusicBrainz Instrument Relations Not Mapping
+
+**Problem**: Instruments showing as "other_instrument" instead of specific types.
+
+**Cause**: MusicBrainz uses `type: "instrument"` with actual instrument in `attributes` array.
+
+**Solution**: Updated `mapMBRelationType()` to check attributes when type is "instrument" or "performer".
+
+---
+
+### Role Types Expanded
+
+Added 45+ role types covering:
+- **Production**: producer, executive_producer, co_producer, vocal_producer, additional_producer
+- **Songwriting**: songwriter, composer, lyricist, arranger
+- **Engineering**: engineer, mixing, mastering, recording, programming
+- **Vocals**: vocals, background_vocals, choir
+- **Instruments**: guitar, bass, drums, percussion, keyboards, piano, organ, synthesizer, violin, cello, strings, saxophone, trumpet, horns, flute, woodwinds, harmonica, turntables
+
 ## Changelog
 
 ### v1.0.0 (Current)

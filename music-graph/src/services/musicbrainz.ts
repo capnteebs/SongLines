@@ -167,6 +167,124 @@ export async function searchArtist(query: string): Promise<MBArtist[]> {
   return data.artists || []
 }
 
+/**
+ * Search for releases by album name and artist
+ */
+async function searchRelease(albumName: string, artistName: string): Promise<Array<{
+  id: string
+  title: string
+  status?: string
+  date?: string
+  score?: number
+  'release-group'?: { 'primary-type'?: string; 'secondary-types'?: string[] }
+}>> {
+  const query = `release:"${albumName}" AND artist:"${artistName}"`
+  const data = await fetchMB<{ releases: Array<{
+    id: string
+    title: string
+    status?: string
+    date?: string
+    score?: number
+    'release-group'?: { 'primary-type'?: string; 'secondary-types'?: string[] }
+  }> }>('/release', { query, limit: '25' })
+  return data.releases || []
+}
+
+/**
+ * Find a recording by looking up the release first, then finding the track
+ * This is more accurate than searching for recordings directly when we know the album
+ */
+async function findRecordingViaRelease(
+  trackName: string,
+  artistName: string,
+  albumName: string
+): Promise<{ recordingId: string; releaseId: string; title: string } | null> {
+  console.log(`[MusicBrainz] Trying release-based lookup for "${trackName}" on "${albumName}"`)
+
+  // Search for the release
+  const releases = await searchRelease(albumName, artistName)
+  if (releases.length === 0) {
+    console.log('[MusicBrainz] No releases found for album')
+    return null
+  }
+
+  // Score releases - prefer original albums, penalize compilations/deluxe/etc
+  const scoredReleases = releases.map(r => {
+    let score = r.score || 0
+    const titleLower = r.title.toLowerCase()
+
+    // Exact album name match
+    if (normalizeForComparison(r.title) === normalizeForComparison(albumName)) {
+      score += 100
+    }
+
+    // Prefer official releases
+    if (r.status === 'Official') {
+      score += 20
+    }
+
+    // Penalize compilations, live albums, etc
+    const secondaryTypes = r['release-group']?.['secondary-types'] || []
+    if (secondaryTypes.some(t => ['Compilation', 'Live', 'Remix', 'DJ-mix'].includes(t))) {
+      score -= 100
+    }
+
+    // Penalize anniversary/deluxe editions
+    if (/\b(25|30|40|50|deluxe|special|anniversary|remaster|expanded)\b/i.test(titleLower)) {
+      score -= 50
+    }
+
+    // Prefer Albums
+    if (r['release-group']?.['primary-type'] === 'Album') {
+      score += 30
+    }
+
+    return { release: r, score }
+  })
+
+  scoredReleases.sort((a, b) => b.score - a.score)
+
+  console.log('[MusicBrainz] Top release matches:')
+  scoredReleases.slice(0, 3).forEach((sr, i) => {
+    console.log(`  ${i + 1}. "${sr.release.title}" (score: ${sr.score}, id: ${sr.release.id})`)
+  })
+
+  // Try top releases to find the track
+  const normalizedTrack = normalizeForComparison(trackName)
+
+  for (const { release } of scoredReleases.slice(0, 3)) {
+    try {
+      // Get tracks from this release
+      const releaseData = await fetchMB<{
+        media?: Array<{
+          tracks?: Array<{
+            recording: { id: string; title: string }
+          }>
+        }>
+      }>(`/release/${release.id}`, { inc: 'recordings' })
+
+      // Find matching track
+      for (const medium of releaseData.media || []) {
+        for (const track of medium.tracks || []) {
+          if (normalizeForComparison(track.recording.title) === normalizedTrack) {
+            console.log(`[MusicBrainz] Found recording via release: ${track.recording.id}`)
+            return {
+              recordingId: track.recording.id,
+              releaseId: release.id,
+              title: track.recording.title
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`[MusicBrainz] Failed to get tracks from release ${release.id}:`, e)
+    }
+  }
+
+  console.log('[MusicBrainz] Track not found on any matching release')
+  return null
+}
+
 interface MBRecordingSearchResult {
   id: string
   title: string
@@ -364,6 +482,18 @@ function normalizeForComparison(str: string): string {
 }
 
 /**
+ * Normalize artist name for deduplication
+ * Handles variations like "J.I.D." vs "JID", "A$AP Rocky" vs "ASAP Rocky"
+ */
+function normalizeArtistName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[.\-_$]/g, '') // Remove periods, hyphens, underscores, dollar signs
+    .replace(/\s+/g, ' ')    // Normalize whitespace
+    .trim()
+}
+
+/**
  * Score how well a recording matches our search criteria
  */
 function scoreRecordingMatch(
@@ -473,42 +603,71 @@ export async function buildGraphFromTrack(
   const relationships: Relationship[] = []
   const entityIds = new Set<string>()
 
-  // Search for the recording - include album in search if provided
-  let recordings = await searchRecording(trackName, artistName, albumName)
+  let recordingMbid: string
+  let recordingTitle: string
+  let releaseIdFromLookup: string | undefined
 
-  // If no results with album, try without it
-  if (recordings.length === 0 && albumName) {
-    console.log('[MusicBrainz] No results with album filter, trying without...')
-    recordings = await searchRecording(trackName, artistName)
+  // STRATEGY 1: If we have an album name, try finding the recording via the release
+  // This is more accurate because it finds the exact recording from that specific release
+  if (albumName) {
+    const releaseResult = await findRecordingViaRelease(trackName, artistName, albumName)
+    if (releaseResult) {
+      recordingMbid = releaseResult.recordingId
+      recordingTitle = releaseResult.title
+      releaseIdFromLookup = releaseResult.releaseId
+      console.log(`[MusicBrainz] Using recording from release lookup: ${recordingMbid}`)
+    }
   }
 
-  if (recordings.length === 0) {
-    console.log('[MusicBrainz] No recordings found, falling back to artist search')
-    return { entities: [], relationships: [] }
+  // STRATEGY 2: Fall back to recording search if release lookup didn't work
+  if (!recordingMbid!) {
+    // Search for the recording - include album in search if provided
+    let recordings = await searchRecording(trackName, artistName, albumName)
+
+    // If no results with album, try without it
+    if (recordings.length === 0 && albumName) {
+      console.log('[MusicBrainz] No results with album filter, trying without...')
+      recordings = await searchRecording(trackName, artistName)
+    }
+
+    if (recordings.length === 0) {
+      console.log('[MusicBrainz] No recordings found, falling back to artist search')
+      return { entities: [], relationships: [] }
+    }
+
+    // Score all recordings and pick the best match
+    const scoredRecordings = recordings.map(r => ({
+      recording: r,
+      score: scoreRecordingMatch(r, trackName, artistName, albumName)
+    }))
+
+    // Sort by score descending
+    scoredRecordings.sort((a, b) => b.score - a.score)
+
+    // Log top matches for debugging
+    console.log('[MusicBrainz] Top recording matches:')
+    scoredRecordings.slice(0, 5).forEach((sr, i) => {
+      const artists = sr.recording['artist-credit']?.map(c => c.artist.name).join(', ') || 'unknown'
+      const releases = sr.recording.releases?.map(r => {
+        const type = r['release-group']?.['primary-type'] || ''
+        return `${r.title}${type ? ` [${type}]` : ''}`
+      }).join(', ') || 'no releases'
+      const disambig = sr.recording.disambiguation ? ` (${sr.recording.disambiguation})` : ''
+      console.log(`  ${i + 1}. "${sr.recording.title}"${disambig} by ${artists}`)
+      console.log(`      Score: ${sr.score}, MBID: ${sr.recording.id}`)
+      console.log(`      Releases: ${releases}`)
+    })
+
+    const bestRecording = scoredRecordings[0]!.recording
+    recordingMbid = bestRecording.id
+    recordingTitle = bestRecording.title
+
+    console.log(`[MusicBrainz] Selected recording: "${bestRecording.title}" (${recordingMbid})`)
   }
-
-  // Score all recordings and pick the best match
-  const scoredRecordings = recordings.map(r => ({
-    recording: r,
-    score: scoreRecordingMatch(r, trackName, artistName, albumName)
-  }))
-
-  // Sort by score descending
-  scoredRecordings.sort((a, b) => b.score - a.score)
-
-  // Log top matches for debugging
-  console.log('[MusicBrainz] Top recording matches:')
-  scoredRecordings.slice(0, 5).forEach((sr, i) => {
-    const releases = sr.recording.releases?.map(r => r.title).join(', ') || 'no releases'
-    console.log(`  ${i + 1}. "${sr.recording.title}" (score: ${sr.score}) - releases: ${releases}`)
-  })
-
-  const bestRecording = scoredRecordings[0]!.recording
-  const recordingMbid = bestRecording.id
 
   // Fetch FULL recording details to get complete artist credits AND releases
   // Search results may have incomplete/abbreviated data
-  console.log('[MusicBrainz] Fetching full recording details for:', recordingMbid)
+  console.log(`[MusicBrainz] View on MusicBrainz: https://musicbrainz.org/recording/${recordingMbid}`)
   const fullRecording = await fetchMB<{
     id: string
     title: string
@@ -546,6 +705,7 @@ export async function buildGraphFromTrack(
   // Primary artists should connect to the album, featured artists only to the track
   const primaryArtistIds = new Set<string>()  // For personnel distinction
   const albumArtistIds = new Set<string>()    // Only searched artist connects to album
+  const normalizedArtistNames = new Set<string>() // For deduplicating artists with name variations (J.I.D. vs JID)
 
   // Add artists from FULL recording's artist-credit (not search result)
   // MusicBrainz uses joinphrase to indicate featured artists:
@@ -584,11 +744,11 @@ export async function buildGraphFromTrack(
                                    normalizedCreditArtist.includes(normalizedSearchArtist) ||
                                    normalizedSearchArtist.includes(normalizedCreditArtist)
 
-    if (!isFeatured && matchesSearchedArtist) {
-      albumArtistIds.add(artistId)
-    }
+    const normalizedName = normalizeArtistName(credit.artist.name)
+    let effectiveArtistId = artistId // The ID to use for relationships
 
-    if (!entityIds.has(artistId)) {
+    // Check both by ID and normalized name to catch duplicates like "J.I.D." vs "JID"
+    if (!entityIds.has(artistId) && !normalizedArtistNames.has(normalizedName)) {
       entities.push({
         id: artistId,
         mbid: credit.artist.id,
@@ -599,16 +759,33 @@ export async function buildGraphFromTrack(
         childrenLoaded: false,
       })
       entityIds.add(artistId)
+      normalizedArtistNames.add(normalizedName)
+    } else if (normalizedArtistNames.has(normalizedName) && !entityIds.has(artistId)) {
+      // Artist exists with different ID but same normalized name - use existing ID for relationships
+      const existingArtist = entities.find(e => normalizeArtistName(e.name) === normalizedName && e.type === 'artist')
+      if (existingArtist) {
+        effectiveArtistId = existingArtist.id
+        console.log(`[MusicBrainz] Deduped artist: "${credit.artist.name}" → "${existingArtist.name}"`)
+      }
+    }
+
+    // Update tracking sets with effective ID
+    primaryArtistIds.add(effectiveArtistId)
+    if (!isFeatured && matchesSearchedArtist) {
+      albumArtistIds.add(effectiveArtistId)
     }
 
     // Track -> Artist relationship with appropriate role
     const role = isFeatured ? 'featured' : 'primary_artist'
-    relationships.push({
-      id: `rel-${trackId}-${artistId}-${role}`,
-      source: trackId,
-      target: artistId,
-      role,
-    })
+    const relId = `rel-${trackId}-${effectiveArtistId}-${role}`
+    if (!relationships.some(r => r.id === relId)) {
+      relationships.push({
+        id: relId,
+        source: trackId,
+        target: effectiveArtistId,
+        role,
+      })
+    }
   }
 
   // Add album from releases (pick best match using scoring)
@@ -742,25 +919,48 @@ export async function buildGraphFromTrack(
   }
 
   // Add personnel from relations (already fetched with full recording details)
-  console.log('[MusicBrainz] Processing personnel relations...')
+  const artistRelations = (fullRecording.relations || []).filter(r => r.artist)
+  const workRelationsCount = (fullRecording.relations || []).filter(r => r.work).length
+  console.log(`[MusicBrainz] Processing personnel: ${artistRelations.length} artist relations, ${workRelationsCount} work relations`)
+
+  // Log all artist relations for debugging
+  if (artistRelations.length > 0) {
+    console.log('[MusicBrainz] Artist relations from recording:')
+    for (const rel of artistRelations) {
+      const attrs = rel.attributes?.length ? ` [${rel.attributes.join(', ')}]` : ''
+      console.log(`  - ${rel.artist!.name}: ${rel.type}${attrs}`)
+    }
+  }
+
   try {
     // Add personnel from relations
     for (const rel of fullRecording.relations || []) {
       if (rel.artist) {
         const personnelId = `artist-${rel.artist.id}`
+        const normalizedName = normalizeArtistName(rel.artist.name)
+
+        // Check if this artist already exists (by ID or normalized name)
+        let effectivePersonnelId = personnelId
+        if (normalizedArtistNames.has(normalizedName) && !entityIds.has(personnelId)) {
+          const existingArtist = entities.find(e => normalizeArtistName(e.name) === normalizedName && e.type === 'artist')
+          if (existingArtist) {
+            effectivePersonnelId = existingArtist.id
+            console.log(`[MusicBrainz] Deduped personnel: "${rel.artist.name}" → "${existingArtist.name}"`)
+          }
+        }
 
         // Skip if this is already a primary artist (don't duplicate)
-        if (primaryArtistIds.has(personnelId)) {
+        if (primaryArtistIds.has(effectivePersonnelId)) {
           // But still add the specific role relationship if it's different
           const role = mapMBRelationType(rel.type, rel.attributes)
           if (role !== 'primary_artist') {
-            const relId = `rel-${trackId}-${personnelId}-${role}`
+            const relId = `rel-${trackId}-${effectivePersonnelId}-${role}`
             // Skip if this exact relationship already exists (deduplication)
             if (!relationships.some(r => r.id === relId)) {
               relationships.push({
                 id: relId,
                 source: trackId,
-                target: personnelId,
+                target: effectivePersonnelId,
                 role,
               })
             }
@@ -768,7 +968,7 @@ export async function buildGraphFromTrack(
           continue
         }
 
-        if (!entityIds.has(personnelId)) {
+        if (!entityIds.has(effectivePersonnelId) && !normalizedArtistNames.has(normalizedName)) {
           entities.push({
             id: personnelId,
             mbid: rel.artist.id,
@@ -778,18 +978,19 @@ export async function buildGraphFromTrack(
             isHidden: false,
             childrenLoaded: false,
           })
+          normalizedArtistNames.add(normalizedName)
           entityIds.add(personnelId)
         }
 
-        // Add relationship with specific role (use mapped role in ID to deduplicate)
+        // Add relationship with specific role (use effective ID for deduplication)
         const role = mapMBRelationType(rel.type, rel.attributes)
-        const relId = `rel-${trackId}-${personnelId}-${role}`
+        const relId = `rel-${trackId}-${effectivePersonnelId}-${role}`
         // Skip if this exact relationship already exists (deduplication)
         if (!relationships.some(r => r.id === relId)) {
           relationships.push({
             id: relId,
             source: trackId,
-            target: personnelId,
+            target: effectivePersonnelId,
             role,
           })
         }
@@ -823,25 +1024,37 @@ export async function buildGraphFromTrack(
               if (!rel.artist) continue
 
               const personnelId = `artist-${rel.artist.id}`
+              const normalizedName = normalizeArtistName(rel.artist.name)
 
-              // Map work relation types to roles
-              // composer, lyricist, writer -> songwriter
+              // Check if this artist already exists (by ID or normalized name)
+              let effectivePersonnelId = personnelId
+              if (normalizedArtistNames.has(normalizedName) && !entityIds.has(personnelId)) {
+                const existingArtist = entities.find(e => normalizeArtistName(e.name) === normalizedName && e.type === 'artist')
+                if (existingArtist) {
+                  effectivePersonnelId = existingArtist.id
+                  console.log(`[MusicBrainz] Deduped work relation: "${rel.artist.name}" → "${existingArtist.name}"`)
+                }
+              }
+
+              // Map work relation types to specific roles
               const workRole = rel.type.toLowerCase()
               let role: Relationship['role'] = 'songwriter'
               if (workRole === 'composer' || workRole === 'music by' || workRole === 'composed by') {
-                role = 'songwriter'
+                role = 'composer'
               } else if (workRole === 'lyricist' || workRole === 'lyrics by') {
-                role = 'songwriter'
+                role = 'lyricist'
               } else if (workRole === 'writer' || workRole === 'written by') {
                 role = 'songwriter'
+              } else if (workRole === 'arranger' || workRole === 'arranged by') {
+                role = 'arranger'
               }
 
-              // Skip if this exact relationship already exists
-              const relId = `rel-${trackId}-${personnelId}-${rel.type}`
+              // Skip if this exact relationship already exists (use MAPPED role for dedup)
+              const relId = `rel-${trackId}-${effectivePersonnelId}-${role}`
               if (relationships.some(r => r.id === relId)) continue
 
               // Add the artist entity if not already present
-              if (!entityIds.has(personnelId)) {
+              if (!entityIds.has(effectivePersonnelId) && !normalizedArtistNames.has(normalizedName)) {
                 entities.push({
                   id: personnelId,
                   mbid: rel.artist.id,
@@ -852,12 +1065,13 @@ export async function buildGraphFromTrack(
                   childrenLoaded: false,
                 })
                 entityIds.add(personnelId)
+                normalizedArtistNames.add(normalizedName)
               }
 
               relationships.push({
                 id: relId,
                 source: trackId,
-                target: personnelId,
+                target: effectivePersonnelId,
                 role,
               })
 
@@ -887,23 +1101,24 @@ export async function buildGraphFromTrack(
       if (discogsCredits.entities.length > 0) {
         console.log(`[Discogs] Found ${discogsCredits.entities.length} additional credits`)
 
-        // Merge Discogs entities, avoiding duplicates by name
-        const existingNames = new Set(entities.map(e => e.name.toLowerCase()))
+        // Merge Discogs entities, avoiding duplicates by normalized name
+        const existingNames = new Set(entities.map(e => normalizeArtistName(e.name)))
         for (const entity of discogsCredits.entities) {
-          if (!existingNames.has(entity.name.toLowerCase())) {
+          if (!existingNames.has(normalizeArtistName(entity.name))) {
             entities.push(entity)
-            existingNames.add(entity.name.toLowerCase())
+            existingNames.add(normalizeArtistName(entity.name))
             entityIds.add(entity.id)
           }
         }
 
         // Merge relationships, mapping Discogs artist IDs to existing entities where possible
         for (const rel of discogsCredits.relationships) {
-          // Try to find existing entity with same name
+          // Try to find existing entity with same name (using normalized comparison)
           const discogsEntity = discogsCredits.entities.find(e => e.id === rel.target)
           if (discogsEntity) {
+            const normalizedDiscogsName = normalizeArtistName(discogsEntity.name)
             const existingEntity = entities.find(e =>
-              e.name.toLowerCase() === discogsEntity.name.toLowerCase() && e.type === 'artist'
+              normalizeArtistName(e.name) === normalizedDiscogsName && e.type === 'artist'
             )
             if (existingEntity && existingEntity.id !== rel.target) {
               // Remap to existing entity

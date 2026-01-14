@@ -271,15 +271,30 @@ async function findBestRelease(
       score += 20
     }
 
+    // Penalize anniversary/deluxe/remaster editions - prefer original releases
+    const titleForEditionCheck = r.title.toLowerCase()
+    if (/\b(25|30|40|50)\b/.test(titleForEditionCheck)) {
+      score -= 40 // Anniversary editions like "Bad 25"
+    }
+    if (/\b(deluxe|special|limited|expanded|remaster|anniversary|collector|box\s*set)\b/i.test(titleForEditionCheck)) {
+      score -= 30
+    }
+
     return { result: r, score }
   })
 
   scored.sort((a, b) => b.score - a.score)
 
+  // Log top matches for debugging
+  console.log('[Discogs] Top release matches:')
+  scored.slice(0, 5).forEach((s, i) => {
+    console.log(`  ${i + 1}. "${s.result.title}" (score: ${s.score})`)
+  })
+
   // Get full release details for best match
   const bestMatch = scored[0]
   if (bestMatch) {
-    console.log(`[Discogs] Best match: "${bestMatch.result.title}" (score: ${bestMatch.score})`)
+    console.log(`[Discogs] Selected: "${bestMatch.result.title}" (score: ${bestMatch.score})`)
     return getRelease(bestMatch.result.id)
   }
 
