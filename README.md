@@ -1,5 +1,7 @@
 # SongLines
 
+![SongLines Screenshot](screenshots/Songlines%20Screenshot.png)
+
 A graph-based music metadata visualization tool that lets you explore relationships between artists, tracks, albums, and labels.
 
 ## Features
